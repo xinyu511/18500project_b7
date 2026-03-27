@@ -36,14 +36,25 @@ BASELINE_M      = 0.060   # ~60 mm baseline (typical eYs3D)
 
 
 # ── camera helpers ─────────────────────────────────────────────────────────────
-def open_camera(device: str, width: int, height: int) -> cv2.VideoCapture:
+def open_stereo_camera(device: str, width: int, combined_height: int) -> cv2.VideoCapture:
+    """
+    Open the eYs3D combined stereo stream.
+    The camera outputs both eyes as one frame: top half = left, bottom half = right.
+    e.g. 640x720 → left=640x360 (rows 0..359), right=640x360 (rows 360..719)
+    """
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera: {device}")
+        raise RuntimeError(f"Cannot open stereo device: {device}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, combined_height)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
     return cap
+
+
+def split_stereo_frame(combined: np.ndarray):
+    """Split a vertically stacked stereo frame into left and right images."""
+    h = combined.shape[0] // 2
+    return combined[:h, :], combined[h:, :]
 
 
 # ── stereo depth ───────────────────────────────────────────────────────────────
@@ -111,14 +122,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="SafeFollow vision pipeline (person tracking + stereo depth)."
     )
-    p.add_argument("--left-device",  default="/dev/video0", help="eYs3D left colour stream")
-    p.add_argument("--right-device", default="/dev/video1", help="eYs3D right colour stream")
-    p.add_argument("--model",        default="yolo11n.pt")
-    p.add_argument("--cam-width",    type=int,   default=640)
-    p.add_argument("--cam-height",   type=int,   default=480)
-    p.add_argument("--imgsz",        type=int,   default=320, help="YOLO inference size")
-    p.add_argument("--conf",         type=float, default=0.40)
-    p.add_argument("--show",         action="store_true", help="Show annotated preview")
+    p.add_argument("--stereo-device", default="/dev/video2",
+                   help="eYs3D combined stereo stream (top=left, bottom=right)")
+    p.add_argument("--model",         default="yolo11n.pt")
+    p.add_argument("--cam-width",     type=int,   default=640)
+    p.add_argument("--cam-height",    type=int,   default=720,
+                   help="Combined frame height (both eyes); single eye = height/2")
+    p.add_argument("--imgsz",         type=int,   default=320, help="YOLO inference size")
+    p.add_argument("--conf",          type=float, default=0.40)
+    p.add_argument("--show",          action="store_true", help="Show annotated preview")
     return p.parse_args()
 
 
@@ -126,8 +138,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    left_cap  = open_camera(args.left_device,  args.cam_width, args.cam_height)
-    right_cap = open_camera(args.right_device, args.cam_width, args.cam_height)
+    cap = open_stereo_camera(args.stereo_device, args.cam_width, args.cam_height)
 
     stereo       = make_stereo_matcher()
     model        = YOLO(args.model)
@@ -138,15 +149,15 @@ def main() -> None:
     last_log_sec = int(prev_time)
     fps          = 0.0
 
-    print("SafeFollow running — left={} right={}. Press q to quit.".format(
-        args.left_device, args.right_device))
+    print(f"SafeFollow running — stereo device={args.stereo_device}. Press q to quit.")
 
     while True:
-        ok_l, left_frame  = left_cap.read()
-        ok_r, right_frame = right_cap.read()
-        if not ok_l or not ok_r:
+        ok, combined = cap.read()
+        if not ok:
             print("Frame grab failed; stopping.")
             break
+
+        left_frame, right_frame = split_stereo_frame(combined)
 
         # ── stereo depth ───────────────────────────────────────────────────────
         gray_l   = cv2.cvtColor(left_frame,  cv2.COLOR_BGR2GRAY)
@@ -226,8 +237,7 @@ def main() -> None:
                       f"  {'LOST' if loss_tracker.lost else 'OK'}")
                 last_log_sec = now_sec
 
-    left_cap.release()
-    right_cap.release()
+    cap.release()
     cv2.destroyAllWindows()
 
 
