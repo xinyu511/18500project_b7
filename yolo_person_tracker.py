@@ -5,18 +5,19 @@ and horizontal offset output for motion control.
 
 Hardware: Raspberry Pi 5 + eYs3D Stereo Camera + YOLO person detector.
 
-The eYs3D camera does NOT expose a Z16 depth stream over V4L2.
-Depth is computed here using OpenCV StereoSGBM from the left (video0)
-and right (video1) YUYV streams.
+Depth priority:
+  1. eYs3D SDK stereo depth  (accurate, metric)      ← requires SDK installed
+  2. V4L2 monocular fallback (bbox-height heuristic) ← always available
 
 Outputs per frame:
-  - user_distance  (metres, median stereo depth within person bbox)
+  - user_distance  (metres)
   - x_offset       (normalised [-1, 1], left=-1, centre=0, right=+1)
-  - track_id       (persistent person ID from YOLO tracker)
-  - target_lost    (True when person absent for TARGET_LOSS_FRAMES frames)
+  - track_id       (persistent person ID)
+  - target_lost    (True after TARGET_LOSS_FRAMES consecutive missed frames)
 """
 
 import argparse
+import os
 import time
 
 import cv2
@@ -24,107 +25,96 @@ import numpy as np
 from ultralytics import YOLO
 
 # ── constants ──────────────────────────────────────────────────────────────────
-PERSON_CLASS = 0
-MIN_DIST_M   = 0.5
-MAX_DIST_M   = 4.0
+PERSON_CLASS       = 0
+MIN_DIST_M         = 0.5
+MAX_DIST_M         = 4.0
 TARGET_LOSS_FRAMES = 10
 
-# eYs3D stereo camera intrinsics (adjust after calibration if needed).
-# Focal length in pixels at 640×480; baseline in metres.
-FOCAL_LENGTH_PX = 462.0   # approximate for eYs3D at 640×480
-BASELINE_M      = 0.060   # ~60 mm baseline (typical eYs3D)
+# Monocular fallback constants — calibrate MONO_FOCAL_PX for your camera:
+#   stand at a known distance D, note bbox height H in pixels, then:
+#   MONO_FOCAL_PX = D * H / PERSON_HEIGHT_M
+PERSON_HEIGHT_M = 1.7
+MONO_FOCAL_PX   = 462.0   # rough default — override with --focal-length
 
 
-# ── camera helpers ─────────────────────────────────────────────────────────────
-def open_left_camera(device: str, width: int, height: int) -> cv2.VideoCapture:
-    """Open the left (primary) eye — used for YOLO and colour display."""
+# ── eYs3D SDK camera ───────────────────────────────────────────────────────────
+def try_open_eys3d(sdk_home: str, width: int, height: int, fps: int):
+    """
+    Try to open the eYs3D camera via the official Python SDK.
+    Returns (pipeline, color_fn, depth_fn) on success, or None on failure.
+
+    sdk_home: path to the cloned eys3d_python_wrapper repo root
+              (set via --sdk-home or EYS3D_SDK_HOME env var)
+    """
+    if sdk_home:
+        os.environ["EYS3D_SDK_HOME"] = sdk_home
+
+    try:
+        from eys3d import Pipeline, Config  # noqa: PLC0415
+    except ImportError:
+        print("[INFO] eYs3D SDK not found — falling back to monocular depth.")
+        return None
+
+    try:
+        config = Config()
+        # Format 0 = YUY2 colour stream
+        config.set_color_stream(streamFormat=0, width=width, height=height, fps=fps)
+        # Format 1 = GRAY_TRANSFER depth stream; 11-bit depth
+        config.set_depth_stream(streamFormat=1, width=width, height=height, fps=fps)
+        config.set_depth_data_type(11)
+
+        pipe = Pipeline()
+        pipe.start(config)
+        print(f"[INFO] eYs3D SDK opened — {width}x{height} @ {fps}fps")
+
+        def get_color():
+            ok, frame = pipe.wait_color_frame(timeout=1600)
+            if not ok:
+                return None
+            arr = frame.get_rgb_data().reshape(frame.get_height(), frame.get_width(), 3)
+            return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+        def get_depth():
+            ok, frame = pipe.wait_depth_frame(timeout=1600)
+            if not ok:
+                return None
+            # ZD values are in mm — convert to metres
+            return frame.get_depth_ZD_value().reshape(
+                frame.get_height(), frame.get_width()
+            ).astype(np.float32) / 1000.0
+
+        return pipe, get_color, get_depth
+
+    except Exception as e:
+        print(f"[WARN] eYs3D SDK failed to open camera: {e}")
+        print("[INFO] Falling back to monocular depth.")
+        return None
+
+
+# ── V4L2 fallback camera ───────────────────────────────────────────────────────
+def open_v4l2_camera(device: str, width: int, height: int) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     if not cap.isOpened():
-        raise RuntimeError(f"Cannot open left camera: {device}")
+        raise RuntimeError(f"Cannot open camera: {device}")
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV"))
     return cap
 
 
-def open_right_camera(device: str, width: int, height: int):
-    """
-    Try to open the right eye / combined stereo stream.
-    Uses 320x480 (30fps) — smaller than 640x720 (10fps) to avoid select() timeout.
-    Returns None if the device cannot stream (falls back to monocular depth).
-    """
-    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        print(f"[WARN] Right camera {device} not available — using monocular depth.")
-        return None
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    # Do NOT force YUYV — let the driver pick the active format
-    ok, _ = cap.read()
-    if not ok:
-        print(f"[WARN] Right camera {device} gave no frames — using monocular depth.")
-        cap.release()
-        return None
-    return cap
-
-
-def split_stereo_frame(combined: np.ndarray):
-    """Split a vertically stacked combined frame into left and right images."""
-    h = combined.shape[0] // 2
-    return combined[:h, :], combined[h:, :]
-
-
-# Monocular fallback: known person height + focal length → distance
-PERSON_HEIGHT_M  = 1.7
-MONO_FOCAL_PX    = 462.0   # calibrate: dist_known * bbox_h / 1.7
-
-def monocular_distance(bbox_h_px: float) -> float:
-    if bbox_h_px <= 0:
-        return float("inf")
-    return (PERSON_HEIGHT_M * MONO_FOCAL_PX) / bbox_h_px
-
-
-# ── stereo depth ───────────────────────────────────────────────────────────────
-def make_stereo_matcher() -> cv2.StereoSGBM:
-    """
-    StereoSGBM tuned for indoor person tracking (0.5–4 m range).
-    minDisparity=0, numDisparities must be divisible by 16.
-    """
-    win  = 5
-    ndisp = 96   # covers ~0.7 m at 4 m with 60 mm baseline / 462 px focal
-    return cv2.StereoSGBM_create(
-        minDisparity=0,
-        numDisparities=ndisp,
-        blockSize=win,
-        P1=8  * 3 * win ** 2,
-        P2=32 * 3 * win ** 2,
-        disp12MaxDiff=1,
-        uniquenessRatio=10,
-        speckleWindowSize=100,
-        speckleRange=32,
-        mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
-    )
-
-
-def disparity_to_depth(disp: np.ndarray) -> np.ndarray:
-    """
-    Convert SGBM disparity (fixed-point ×16) to float32 depth in metres.
-    depth = focal_px * baseline_m / disparity_px
-    """
-    disp_f = disp.astype(np.float32) / 16.0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        depth = np.where(
-            disp_f > 0,
-            FOCAL_LENGTH_PX * BASELINE_M / disp_f,
-            np.inf,
-        )
-    return depth
-
-
+# ── depth helpers ──────────────────────────────────────────────────────────────
 def median_depth_in_box(depth_m: np.ndarray, x1: int, y1: int, x2: int, y2: int) -> float:
+    """Median valid stereo depth (metres) inside a bounding box."""
     roi   = depth_m[y1:y2, x1:x2]
     valid = roi[(roi >= MIN_DIST_M) & (roi <= MAX_DIST_M)]
     return float(np.median(valid)) if valid.size > 0 else float("inf")
+
+
+def monocular_distance(bbox_h_px: float, focal_px: float) -> float:
+    """Apparent-height monocular estimate. Calibrate focal_px for accuracy."""
+    if bbox_h_px <= 0:
+        return float("inf")
+    return (PERSON_HEIGHT_M * focal_px) / bbox_h_px
 
 
 # ── target-loss tracker ────────────────────────────────────────────────────────
@@ -147,70 +137,77 @@ class TargetLossTracker:
 # ── CLI ────────────────────────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="SafeFollow vision pipeline (person tracking + stereo depth)."
+        description="SafeFollow vision pipeline (person tracking + stereo/monocular depth)."
     )
-    p.add_argument("--left-device",  default="/dev/video0", help="eYs3D left eye (colour + YOLO)")
-    p.add_argument("--right-device", default="/dev/video2", help="eYs3D right eye (stereo depth)")
+    p.add_argument("--sdk-home",     default=os.environ.get("EYS3D_SDK_HOME", ""),
+                   help="Path to cloned eys3d_python_wrapper repo (enables stereo depth)")
+    p.add_argument("--left-device",  default="/dev/video0",
+                   help="V4L2 left camera (used when SDK unavailable)")
     p.add_argument("--model",        default="yolo11n.pt")
     p.add_argument("--cam-width",    type=int,   default=640)
-    p.add_argument("--cam-height",   type=int,   default=360,
-                   help="Single-eye frame height (320x480 combined → 320x240 each)")
-    p.add_argument("--imgsz",        type=int,   default=320, help="YOLO inference size")
+    p.add_argument("--cam-height",   type=int,   default=360)
+    p.add_argument("--cam-fps",      type=int,   default=15)
+    p.add_argument("--imgsz",        type=int,   default=320)
     p.add_argument("--conf",         type=float, default=0.40)
-    p.add_argument("--show",         action="store_true", help="Show annotated preview")
+    p.add_argument("--focal-length", type=float, default=MONO_FOCAL_PX,
+                   help="Monocular focal length in px (calibrate if SDK unavailable)")
+    p.add_argument("--show",         action="store_true")
     return p.parse_args()
 
 
-# ── main loop ──────────────────────────────────────────────────────────────────
+# ── main ───────────────────────────────────────────────────────────────────────
 def main() -> None:
     args = parse_args()
 
-    # Left eye always required (YOLO runs here)
-    left_cap = open_left_camera(args.left_device, args.cam_width, args.cam_height)
+    # Try eYs3D SDK first; fall back to V4L2 monocular
+    sdk_result = try_open_eys3d(args.sdk_home, args.cam_width, args.cam_height, args.cam_fps)
 
-    # Right eye optional — falls back to monocular if unavailable
-    right_cap   = open_right_camera(args.right_device, args.cam_width, args.cam_height)
-    use_stereo  = right_cap is not None
-    stereo      = make_stereo_matcher() if use_stereo else None
-    depth_mode  = "stereo" if use_stereo else "monocular"
+    if sdk_result is not None:
+        pipe, get_color, get_depth = sdk_result
+        v4l2_cap   = None
+        depth_mode = "stereo"
+    else:
+        v4l2_cap   = open_v4l2_camera(args.left_device, args.cam_width, args.cam_height)
+        get_color  = None
+        get_depth  = None
+        depth_mode = "monocular"
+
     print(f"Depth mode: {depth_mode}")
 
     model        = YOLO(args.model)
     loss_tracker = TargetLossTracker()
     frame_cx     = args.cam_width / 2.0
+    focal_px     = args.focal_length
 
     prev_time    = time.time()
     last_log_sec = int(prev_time)
     fps          = 0.0
 
-    print(f"SafeFollow running — left={args.left_device} right={args.right_device}. Press q to quit.")
+    print("SafeFollow running. Press q to quit.")
 
     while True:
-        ok, left_frame = left_cap.read()
-        if not ok:
-            print("Left camera frame grab failed; stopping.")
-            break
-
-        # ── depth ─────────────────────────────────────────────────────────────
-        if use_stereo:
-            ok_r, right_frame = right_cap.read()
-            if ok_r:
-                gray_l  = cv2.cvtColor(left_frame,  cv2.COLOR_BGR2GRAY)
-                gray_r  = cv2.cvtColor(right_frame, cv2.COLOR_BGR2GRAY)
-                disp    = stereo.compute(gray_l, gray_r)
-                depth_m = disparity_to_depth(disp)
-            else:
-                depth_m = None   # stereo read failed this frame; use monocular below
+        # ── grab frames ───────────────────────────────────────────────────────
+        if depth_mode == "stereo":
+            color_frame = get_color()
+            depth_m     = get_depth()
+            if color_frame is None:
+                print("SDK color frame failed; stopping.")
+                break
         else:
+            ok, color_frame = v4l2_cap.read()
+            if not ok:
+                print("Camera frame grab failed; stopping.")
+                break
             depth_m = None
 
         # ── YOLO person tracking ───────────────────────────────────────────────
         results = model.track(
-            source=left_frame,
+            source=color_frame,
             imgsz=args.imgsz,
             conf=args.conf,
             classes=[PERSON_CLASS],
             persist=True,
+            tracker="bytetrack_safefollow.yaml",
             verbose=False,
             device="cpu",
         )
@@ -232,7 +229,7 @@ def main() -> None:
                 if depth_m is not None:
                     dist = median_depth_in_box(depth_m, x1, y1, x2, y2)
                 else:
-                    dist = monocular_distance(y2 - y1)
+                    dist = monocular_distance(y2 - y1, focal_px)
 
                 if dist < user_distance:
                     user_distance = dist
@@ -281,9 +278,10 @@ def main() -> None:
                       f"  {'LOST' if loss_tracker.lost else 'OK'}")
                 last_log_sec = now_sec
 
-    left_cap.release()
-    if right_cap is not None:
-        right_cap.release()
+    if depth_mode == "stereo":
+        pipe.stop()
+    else:
+        v4l2_cap.release()
     cv2.destroyAllWindows()
 
 
