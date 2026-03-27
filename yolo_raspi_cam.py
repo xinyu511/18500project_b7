@@ -326,6 +326,9 @@ def main() -> None:
                     gray_l = cv2.equalizeHist(gray_l)
                     gray_r = cv2.equalizeHist(gray_r)
                 disparity_small = stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
+                # Disparity is measured in the downscaled image pixel units.
+                # Convert to full-resolution pixel disparity before depth conversion.
+                disparity_small /= scale
                 disparity_small = cv2.medianBlur(disparity_small, 5)
                 disparity_for_sampling = cv2.resize(
                     disparity_small, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR
