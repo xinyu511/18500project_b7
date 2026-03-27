@@ -66,8 +66,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disp-num",
         type=int,
-        default=64,
-        help="StereoSGBM numDisparities (multiple of 16)",
+        default=48,
+        help="Stereo matcher numDisparities (multiple of 16)",
+    )
+    parser.add_argument(
+        "--stereo-algo",
+        choices=("bm", "sgbm"),
+        default="bm",
+        help="Stereo matcher algorithm (bm is faster, sgbm can be denser)",
+    )
+    parser.add_argument(
+        "--disp-every",
+        type=int,
+        default=2,
+        help="Recompute disparity every N frames (reuse previous map in between)",
+    )
+    parser.add_argument(
+        "--swap-lr",
+        action="store_true",
+        help="Swap left/right images before stereo matching if depth looks inverted",
+    )
+    parser.add_argument(
+        "--min-depth-m",
+        type=float,
+        default=0.3,
+        help="Minimum accepted stereo depth in meters",
+    )
+    parser.add_argument(
+        "--max-depth-m",
+        type=float,
+        default=8.0,
+        help="Maximum accepted stereo depth in meters",
+    )
+    parser.add_argument(
+        "--sample-y-ratio",
+        type=float,
+        default=0.7,
+        help="Vertical sample point inside bbox for depth (0=top, 1=bottom)",
     )
     parser.add_argument(
         "--show-disparity",
@@ -125,13 +160,26 @@ def estimate_distance_and_angle(
     return distance_m, angle_deg
 
 
-def make_stereo_matcher(block_size: int, num_disparities: int) -> cv2.StereoSGBM:
+def make_stereo_matcher(
+    algo: str, block_size: int, num_disparities: int
+) -> cv2.StereoMatcher:
     if block_size % 2 == 0:
         block_size += 1
     if num_disparities < 16:
         num_disparities = 16
     if num_disparities % 16 != 0:
         num_disparities = (num_disparities // 16 + 1) * 16
+
+    if algo == "bm":
+        matcher = cv2.StereoBM_create(numDisparities=num_disparities, blockSize=block_size)
+        matcher.setPreFilterType(cv2.STEREO_BM_PREFILTER_XSOBEL)
+        matcher.setPreFilterSize(9)
+        matcher.setPreFilterCap(31)
+        matcher.setTextureThreshold(10)
+        matcher.setUniquenessRatio(10)
+        matcher.setSpeckleWindowSize(50)
+        matcher.setSpeckleRange(2)
+        return matcher
 
     return cv2.StereoSGBM_create(
         minDisparity=0,
@@ -155,16 +203,20 @@ def get_stereo_frames(
         ok, frame = cap_left.read()
         if not ok:
             return False, None, None
-        h, w = frame.shape[:2]
+        _h, w = frame.shape[:2]
         half_w = w // 2
         left = frame[:, :half_w]
         right = frame[:, half_w:]
+        if args.swap_lr:
+            left, right = right, left
         return True, left, right
 
     ok_left, left = cap_left.read()
     ok_right, right = cap_right.read() if cap_right is not None else (False, None)
     if not ok_left or not ok_right:
         return False, None, None
+    if args.swap_lr:
+        left, right = right, left
     return True, left, right
 
 
@@ -173,7 +225,13 @@ def disparity_to_depth_m(disparity_px: float, focal_px: float, baseline_m: float
 
 
 def sample_depth_from_disparity(
-    disparity_map: np.ndarray, cx: int, cy: int, focal_px: float, baseline_m: float
+    disparity_map: np.ndarray,
+    cx: int,
+    cy: int,
+    focal_px: float,
+    baseline_m: float,
+    min_depth_m: float,
+    max_depth_m: float,
 ) -> float | None:
     patch_radius = 3
     y0 = max(0, cy - patch_radius)
@@ -185,7 +243,10 @@ def sample_depth_from_disparity(
     if valid.size == 0:
         return None
     disp = float(np.median(valid))
-    return disparity_to_depth_m(disp, focal_px, baseline_m)
+    depth_m = disparity_to_depth_m(disp, focal_px, baseline_m)
+    if depth_m < min_depth_m or depth_m > max_depth_m:
+        return None
+    return depth_m
 
 
 def main() -> None:
@@ -215,14 +276,17 @@ def main() -> None:
         cap_right.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*args.fourcc.upper()))
 
     model = YOLO(args.model)
-    stereo_matcher = make_stereo_matcher(args.disp_block_size, args.disp_num)
+    stereo_matcher = make_stereo_matcher(args.stereo_algo, args.disp_block_size, args.disp_num)
 
     prev_time = time.time()
     last_logged_sec = int(prev_time)
     fps = 0.0
+    frame_idx = 0
+    disparity_for_sampling = None
 
     print("Running detection. Press 'q' in preview window to quit.")
     while True:
+        frame_idx += 1
         if args.distance_mode == "stereo":
             ok, left_frame, right_frame = get_stereo_frames(args, cap, cap_right)
             frame = left_frame
@@ -245,27 +309,32 @@ def main() -> None:
         annotated = frame.copy()
         frame_h, frame_w = annotated.shape[:2]
         focal_px_x = (frame_w * 0.5) / math.tan(math.radians(args.hfov_deg) * 0.5)
-        disparity_for_sampling = None
         disparity_vis = None
         if args.distance_mode == "stereo":
             scale = max(0.2, min(1.0, args.stereo_proc_scale))
-            left_small = cv2.resize(
-                left_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-            )
-            right_small = cv2.resize(
-                right_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-            )
-            gray_l = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
-            gray_r = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
-            disparity_small = stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
-            disparity_for_sampling = cv2.resize(
-                disparity_small, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR
-            )
-            if args.show_disparity:
-                disp_norm = cv2.normalize(
-                    disparity_small, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
+            refresh_every = max(1, args.disp_every)
+            if disparity_for_sampling is None or frame_idx % refresh_every == 0:
+                left_small = cv2.resize(
+                    left_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
                 )
-                disparity_vis = disp_norm.astype(np.uint8)
+                right_small = cv2.resize(
+                    right_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+                )
+                gray_l = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
+                gray_r = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
+                if args.stereo_algo == "bm":
+                    gray_l = cv2.equalizeHist(gray_l)
+                    gray_r = cv2.equalizeHist(gray_r)
+                disparity_small = stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
+                disparity_small = cv2.medianBlur(disparity_small, 5)
+                disparity_for_sampling = cv2.resize(
+                    disparity_small, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR
+                )
+                if args.show_disparity:
+                    disp_norm = cv2.normalize(
+                        disparity_small, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
+                    )
+                    disparity_vis = disp_norm.astype(np.uint8)
 
         boxes = results[0].boxes
         person_count = 0
@@ -278,13 +347,16 @@ def main() -> None:
                 )
                 if args.distance_mode == "stereo" and disparity_for_sampling is not None:
                     cx = int(0.5 * (x1 + x2))
-                    cy = int(0.5 * (y1 + y2))
+                    sample_y_ratio = max(0.0, min(1.0, args.sample_y_ratio))
+                    cy = int(y1 + sample_y_ratio * (y2 - y1))
                     distance_m = sample_depth_from_disparity(
                         disparity_map=disparity_for_sampling,
                         cx=cx,
                         cy=cy,
                         focal_px=focal_px_x,
                         baseline_m=args.baseline_m,
+                        min_depth_m=args.min_depth_m,
+                        max_depth_m=args.max_depth_m,
                     )
                 else:
                     distance_m, _ = estimate_distance_and_angle(
