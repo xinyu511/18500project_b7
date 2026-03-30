@@ -9,6 +9,7 @@ from ultralytics import YOLO
 
 H_BINS = 24
 S_BINS = 16
+OVERLAP_IOU_THRESHOLD = 0.20
 
 
 def parse_args() -> argparse.Namespace:
@@ -319,6 +320,24 @@ def color_similarity(hist_a, hist_b) -> float:
     return float(max(0.0, min(1.0, 1.0 - dist)))
 
 
+def bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    return inter / denom if denom > 0 else 0.0
+
+
 class TrackIdMapper:
     """Hybrid tracker+appearance mapping to compact, stable display IDs."""
 
@@ -343,9 +362,13 @@ class TrackIdMapper:
         self.next_display_id = next_id + 1
         return next_id
 
-    def _match_display_id(self, hist, cx: float, cy: float, frame_diag: float, used_ids: set[int]):
+    def _match_display_id(
+        self, hist, cx: float, cy: float, frame_diag: float, used_ids: set[int], overlap: bool
+    ):
         best_id = None
         best_score = float("inf")
+        color_w = 0.90 if overlap else 0.75
+        pos_w = 1.0 - color_w
         for disp_id, model in self.display_models.items():
             if disp_id in used_ids:
                 continue
@@ -354,7 +377,7 @@ class TrackIdMapper:
             pos_term = min(
                 1.0, math.hypot(cx - model.get("cx", cx), cy - model.get("cy", cy)) / frame_diag
             )
-            score = 0.75 * color_term + 0.25 * pos_term
+            score = color_w * color_term + pos_w * pos_term
             if score < best_score:
                 best_score = score
                 best_id = disp_id
@@ -366,26 +389,47 @@ class TrackIdMapper:
         frame_diag = max(1.0, math.hypot(frame_w, frame_h))
         assigned_display_ids: list[int] = []
         used_ids: set[int] = set()
+        overlap_flags = [False] * len(detections)
+        for i in range(len(detections)):
+            box_i = (
+                detections[i]["x1"],
+                detections[i]["y1"],
+                detections[i]["x2"],
+                detections[i]["y2"],
+            )
+            for j in range(i + 1, len(detections)):
+                box_j = (
+                    detections[j]["x1"],
+                    detections[j]["y1"],
+                    detections[j]["x2"],
+                    detections[j]["y2"],
+                )
+                if bbox_iou(box_i, box_j) >= OVERLAP_IOU_THRESHOLD:
+                    overlap_flags[i] = True
+                    overlap_flags[j] = True
 
-        for det in detections:
+        for idx, det in enumerate(detections):
             raw_id = det["raw_track_id"]
             hist = det["hist"]
             cx = det["cx"]
             cy = det["cy"]
+            overlap = overlap_flags[idx]
 
             display_id = None
             if raw_id is not None and raw_id in self.raw_to_display:
                 candidate = self.raw_to_display[raw_id]
                 model = self.display_models.get(candidate)
+                sim_to_candidate = color_similarity(hist, model.get("hist")) if model is not None else 0.0
                 if (
                     model is not None
                     and candidate not in used_ids
                     and frame_idx - model.get("last_seen", frame_idx) <= self.max_missing_frames
+                    and (not overlap or sim_to_candidate >= 0.35)
                 ):
                     display_id = candidate
 
             if display_id is None:
-                display_id = self._match_display_id(hist, cx, cy, frame_diag, used_ids)
+                display_id = self._match_display_id(hist, cx, cy, frame_diag, used_ids, overlap)
 
             if display_id is None:
                 display_id = self._alloc_display_id()
@@ -403,8 +447,9 @@ class TrackIdMapper:
                     if model.get("hist") is None:
                         model["hist"] = hist
                     else:
+                        hist_ema = min(self.hist_ema, 0.08) if overlap else self.hist_ema
                         model["hist"] = cv2.addWeighted(
-                            model["hist"], 1.0 - self.hist_ema, hist, self.hist_ema, 0.0
+                            model["hist"], 1.0 - hist_ema, hist, hist_ema, 0.0
                         )
                         model["hist"] = cv2.normalize(
                             model["hist"], model["hist"], alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1
