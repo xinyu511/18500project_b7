@@ -82,6 +82,18 @@ def parse_args() -> argparse.Namespace:
         help="Recompute disparity every N frames (reuse previous map in between)",
     )
     parser.add_argument(
+        "--depth-scale",
+        type=float,
+        default=1.0,
+        help="Multiplicative correction applied to stereo depth",
+    )
+    parser.add_argument(
+        "--depth-offset",
+        type=float,
+        default=0.0,
+        help="Subtractive correction in meters applied after depth scaling",
+    )
+    parser.add_argument(
         "--swap-lr",
         action="store_true",
         help="Swap left/right images before stereo matching if depth looks inverted",
@@ -221,32 +233,50 @@ def get_stereo_frames(
 
 
 def disparity_to_depth_m(disparity_px: float, focal_px: float, baseline_m: float) -> float:
+    if disparity_px <= 0.5:
+        return float("inf")
     return (focal_px * baseline_m) / disparity_px
 
 
 def sample_depth_from_disparity(
     disparity_map: np.ndarray,
-    cx: int,
-    cy: int,
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
     focal_px: float,
     baseline_m: float,
     min_depth_m: float,
     max_depth_m: float,
+    patch_radius: int = 5,
+    num_samples: int = 5,
 ) -> float | None:
-    patch_radius = 3
-    y0 = max(0, cy - patch_radius)
-    y1 = min(disparity_map.shape[0], cy + patch_radius + 1)
-    x0 = max(0, cx - patch_radius)
-    x1 = min(disparity_map.shape[1], cx + patch_radius + 1)
-    patch = disparity_map[y0:y1, x0:x1]
-    valid = patch[patch > 0.5]
-    if valid.size == 0:
+    cx = int(0.5 * (x1 + x2))
+    depths: list[float] = []
+    h, w = disparity_map.shape[:2]
+
+    for i in range(num_samples):
+        t = 0.3 + 0.4 * (i / max(1, num_samples - 1))
+        cy = int(y1 + t * (y2 - y1))
+
+        py0 = max(0, cy - patch_radius)
+        py1 = min(h, cy + patch_radius + 1)
+        px0 = max(0, cx - patch_radius)
+        px1 = min(w, cx + patch_radius + 1)
+
+        patch = disparity_map[py0:py1, px0:px1]
+        valid = patch[patch > 0.5]
+        if valid.size == 0:
+            continue
+
+        disp = float(np.median(valid))
+        depth_m = disparity_to_depth_m(disp, focal_px, baseline_m)
+        if np.isfinite(depth_m) and min_depth_m <= depth_m <= max_depth_m:
+            depths.append(depth_m)
+
+    if not depths:
         return None
-    disp = float(np.median(valid))
-    depth_m = disparity_to_depth_m(disp, focal_px, baseline_m)
-    if depth_m < min_depth_m or depth_m > max_depth_m:
-        return None
-    return depth_m
+    return float(np.median(depths))
 
 
 def main() -> None:
@@ -349,18 +379,38 @@ def main() -> None:
                     math.atan(((0.5 * (x1 + x2)) - frame_w * 0.5) / focal_px_x)
                 )
                 if args.distance_mode == "stereo" and disparity_for_sampling is not None:
-                    cx = int(0.5 * (x1 + x2))
-                    sample_y_ratio = max(0.0, min(1.0, args.sample_y_ratio))
-                    cy = int(y1 + sample_y_ratio * (y2 - y1))
                     distance_m = sample_depth_from_disparity(
                         disparity_map=disparity_for_sampling,
-                        cx=cx,
-                        cy=cy,
+                        x1=int(x1),
+                        y1=int(y1),
+                        x2=int(x2),
+                        y2=int(y2),
                         focal_px=focal_px_x,
                         baseline_m=args.baseline_m,
                         min_depth_m=args.min_depth_m,
                         max_depth_m=args.max_depth_m,
                     )
+
+                    if distance_m is not None:
+                        distance_m = args.depth_scale * distance_m - args.depth_offset
+                        if distance_m < args.min_depth_m or distance_m > args.max_depth_m:
+                            distance_m = None
+
+                    if distance_m is None:
+                        distance_m, _ = estimate_distance_and_angle(
+                            x1=x1,
+                            y1=y1,
+                            x2=x2,
+                            y2=y2,
+                            frame_w=frame_w,
+                            frame_h=frame_h,
+                            hfov_deg=args.hfov_deg,
+                            vfov_deg=args.vfov_deg,
+                            person_height_m=args.person_height_m,
+                        )
+                        dist_text = f"~{distance_m:.2f}m"
+                    else:
+                        dist_text = f"{distance_m:.2f}m"
                 else:
                     distance_m, _ = estimate_distance_and_angle(
                         x1=x1,
@@ -373,15 +423,12 @@ def main() -> None:
                         vfov_deg=args.vfov_deg,
                         person_height_m=args.person_height_m,
                     )
+                    dist_text = f"{distance_m:.2f}m"
                 person_count += 1
 
                 p1 = (int(x1), int(y1))
                 p2 = (int(x2), int(y2))
                 cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
-                if distance_m is None:
-                    dist_text = "N/A"
-                else:
-                    dist_text = f"{distance_m:.2f}m"
                 label = f"person {conf:.2f} {dist_text} {angle_deg:+.1f}deg"
                 text_org = (p1[0], max(20, p1[1] - 8))
                 cv2.putText(
