@@ -7,6 +7,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+H_BINS = 24
+S_BINS = 16
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -279,44 +282,150 @@ def sample_depth_from_disparity(
     return float(np.median(depths))
 
 
-class TrackIdMapper:
-    """Map tracker-generated IDs to compact display IDs."""
+def clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int):
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h))
+    return x1, y1, x2, y2
 
-    def __init__(self, max_missing_frames: int = 45):
+
+def person_color_histogram(frame_bgr: np.ndarray, x1: int, y1: int, x2: int, y2: int):
+    """Extract HSV appearance descriptor from torso region."""
+    h, w = frame_bgr.shape[:2]
+    x1, y1, x2, y2 = clamp_box(x1, y1, x2, y2, w, h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    bh = y2 - y1
+    torso_y1 = y1 + int(0.20 * bh)
+    torso_y2 = y1 + int(0.75 * bh)
+    torso_y1 = max(y1, min(torso_y1, y2 - 1))
+    torso_y2 = max(torso_y1 + 1, min(torso_y2, y2))
+    roi = frame_bgr[torso_y1:torso_y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [H_BINS, S_BINS], [0, 180, 0, 256])
+    hist = cv2.normalize(hist, hist, alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1)
+    return hist
+
+
+def color_similarity(hist_a, hist_b) -> float:
+    if hist_a is None or hist_b is None:
+        return 0.0
+    dist = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_BHATTACHARYYA)  # 0=best
+    return float(max(0.0, min(1.0, 1.0 - dist)))
+
+
+class TrackIdMapper:
+    """Hybrid tracker+appearance mapping to compact, stable display IDs."""
+
+    def __init__(
+        self,
+        max_missing_frames: int = 45,
+        hist_ema: float = 0.20,
+        match_threshold: float = 0.55,
+    ):
         self.max_missing_frames = max_missing_frames
+        self.hist_ema = hist_ema
+        self.match_threshold = match_threshold
         self.raw_to_display: dict[int, int] = {}
-        self.last_seen_frame: dict[int, int] = {}
+        self.display_models: dict[int, dict] = {}
         self.next_display_id = 1
 
-    def update(self, raw_track_ids: list[int], frame_idx: int) -> dict[int, int]:
-        active_ids = set(raw_track_ids)
-
-        for raw_id in raw_track_ids:
-            if raw_id not in self.raw_to_display:
-                self.raw_to_display[raw_id] = self.next_display_id
-                self.next_display_id += 1
-            self.last_seen_frame[raw_id] = frame_idx
-
-        stale_ids = [
-            raw_id
-            for raw_id, last_seen in self.last_seen_frame.items()
-            if raw_id not in active_ids and frame_idx - last_seen > self.max_missing_frames
-        ]
-        for raw_id in stale_ids:
-            self.raw_to_display.pop(raw_id, None)
-            self.last_seen_frame.pop(raw_id, None)
-
-        active_display_ids = set(self.raw_to_display.values())
+    def _alloc_display_id(self) -> int:
+        active_ids = set(self.display_models.keys())
         next_id = 1
-        while next_id in active_display_ids:
+        while next_id in active_ids:
             next_id += 1
-        self.next_display_id = next_id
+        self.next_display_id = next_id + 1
+        return next_id
 
-        return {
-            raw_id: self.raw_to_display[raw_id]
-            for raw_id in raw_track_ids
-            if raw_id in self.raw_to_display
-        }
+    def _match_display_id(self, hist, cx: float, cy: float, frame_diag: float):
+        best_id = None
+        best_score = float("inf")
+        for disp_id, model in self.display_models.items():
+            sim = color_similarity(hist, model.get("hist"))
+            color_term = 1.0 - sim
+            pos_term = min(
+                1.0, math.hypot(cx - model.get("cx", cx), cy - model.get("cy", cy)) / frame_diag
+            )
+            score = 0.75 * color_term + 0.25 * pos_term
+            if score < best_score:
+                best_score = score
+                best_id = disp_id
+        if best_id is not None and best_score <= self.match_threshold:
+            return best_id
+        return None
+
+    def update(self, detections: list[dict], frame_idx: int, frame_w: int, frame_h: int) -> list[int]:
+        frame_diag = max(1.0, math.hypot(frame_w, frame_h))
+        assigned_display_ids: list[int] = []
+
+        for det in detections:
+            raw_id = det["raw_track_id"]
+            hist = det["hist"]
+            cx = det["cx"]
+            cy = det["cy"]
+
+            display_id = None
+            if raw_id is not None and raw_id in self.raw_to_display:
+                candidate = self.raw_to_display[raw_id]
+                model = self.display_models.get(candidate)
+                if model is not None and frame_idx - model.get("last_seen", frame_idx) <= self.max_missing_frames:
+                    display_id = candidate
+
+            if display_id is None:
+                display_id = self._match_display_id(hist, cx, cy, frame_diag)
+
+            if display_id is None:
+                display_id = self._alloc_display_id()
+
+            model = self.display_models.get(display_id)
+            if model is None:
+                self.display_models[display_id] = {
+                    "hist": hist,
+                    "cx": cx,
+                    "cy": cy,
+                    "last_seen": frame_idx,
+                }
+            else:
+                if hist is not None:
+                    if model.get("hist") is None:
+                        model["hist"] = hist
+                    else:
+                        model["hist"] = cv2.addWeighted(
+                            model["hist"], 1.0 - self.hist_ema, hist, self.hist_ema, 0.0
+                        )
+                        model["hist"] = cv2.normalize(
+                            model["hist"], model["hist"], alpha=1.0, beta=0.0, norm_type=cv2.NORM_L1
+                        )
+                model["cx"] = 0.7 * model.get("cx", cx) + 0.3 * cx
+                model["cy"] = 0.7 * model.get("cy", cy) + 0.3 * cy
+                model["last_seen"] = frame_idx
+
+            if raw_id is not None:
+                self.raw_to_display[raw_id] = display_id
+            assigned_display_ids.append(display_id)
+
+        stale_displays = [
+            disp_id
+            for disp_id, model in self.display_models.items()
+            if frame_idx - model.get("last_seen", frame_idx) > self.max_missing_frames
+        ]
+        for disp_id in stale_displays:
+            self.display_models.pop(disp_id, None)
+
+        valid_disp_ids = set(self.display_models.keys())
+        stale_raw_ids = [
+            raw_id for raw_id, disp_id in self.raw_to_display.items() if disp_id not in valid_disp_ids
+        ]
+        for raw_id in stale_raw_ids:
+            self.raw_to_display.pop(raw_id, None)
+
+        return assigned_display_ids
 
 
 def main() -> None:
@@ -414,20 +523,37 @@ def main() -> None:
 
         boxes = results[0].boxes
         person_count = 0
-        raw_track_ids: list[int] = []
-        if boxes is not None:
-            for box in boxes:
-                if box.id is not None:
-                    raw_track_ids.append(int(box.id[0]))
-        display_track_ids = track_id_mapper.update(raw_track_ids, frame_idx)
+        detections: list[dict] = []
         if boxes is not None:
             for box in boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 conf = float(box.conf[0])
-                track_id = None
-                if box.id is not None:
-                    raw_track_id = int(box.id[0])
-                    track_id = display_track_ids.get(raw_track_id)
+                raw_track_id = int(box.id[0]) if box.id is not None else None
+                cx = 0.5 * (x1 + x2)
+                cy = 0.5 * (y1 + y2)
+                hist = person_color_histogram(frame, int(x1), int(y1), int(x2), int(y2))
+                detections.append(
+                    {
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "conf": conf,
+                        "raw_track_id": raw_track_id,
+                        "cx": cx,
+                        "cy": cy,
+                        "hist": hist,
+                    }
+                )
+
+        display_ids = track_id_mapper.update(detections, frame_idx, frame_w, frame_h)
+
+        for det, track_id in zip(detections, display_ids):
+                x1 = det["x1"]
+                y1 = det["y1"]
+                x2 = det["x2"]
+                y2 = det["y2"]
+                conf = det["conf"]
                 angle_deg = math.degrees(
                     math.atan(((0.5 * (x1 + x2)) - frame_w * 0.5) / focal_px_x)
                 )
