@@ -279,6 +279,46 @@ def sample_depth_from_disparity(
     return float(np.median(depths))
 
 
+class TrackIdMapper:
+    """Map tracker-generated IDs to compact display IDs."""
+
+    def __init__(self, max_missing_frames: int = 45):
+        self.max_missing_frames = max_missing_frames
+        self.raw_to_display: dict[int, int] = {}
+        self.last_seen_frame: dict[int, int] = {}
+        self.next_display_id = 1
+
+    def update(self, raw_track_ids: list[int], frame_idx: int) -> dict[int, int]:
+        active_ids = set(raw_track_ids)
+
+        for raw_id in raw_track_ids:
+            if raw_id not in self.raw_to_display:
+                self.raw_to_display[raw_id] = self.next_display_id
+                self.next_display_id += 1
+            self.last_seen_frame[raw_id] = frame_idx
+
+        stale_ids = [
+            raw_id
+            for raw_id, last_seen in self.last_seen_frame.items()
+            if raw_id not in active_ids and frame_idx - last_seen > self.max_missing_frames
+        ]
+        for raw_id in stale_ids:
+            self.raw_to_display.pop(raw_id, None)
+            self.last_seen_frame.pop(raw_id, None)
+
+        active_display_ids = set(self.raw_to_display.values())
+        next_id = 1
+        while next_id in active_display_ids:
+            next_id += 1
+        self.next_display_id = next_id
+
+        return {
+            raw_id: self.raw_to_display[raw_id]
+            for raw_id in raw_track_ids
+            if raw_id in self.raw_to_display
+        }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -313,6 +353,7 @@ def main() -> None:
     fps = 0.0
     frame_idx = 0
     disparity_for_sampling = None
+    track_id_mapper = TrackIdMapper()
 
     print("Running detection. Press 'q' in preview window to quit.")
     while True:
@@ -327,13 +368,15 @@ def main() -> None:
             print("Frame grab failed; stopping.")
             break
 
-        results = model.predict(
+        results = model.track(
             source=frame,
             imgsz=args.imgsz,
             conf=args.conf,
             classes=[0],  # person only (COCO class id 0)
             verbose=False,
             device="cpu",
+            persist=True,
+            tracker="bytetrack.yaml",
         )
 
         annotated = frame.copy()
@@ -371,10 +414,20 @@ def main() -> None:
 
         boxes = results[0].boxes
         person_count = 0
+        raw_track_ids: list[int] = []
+        if boxes is not None:
+            for box in boxes:
+                if box.id is not None:
+                    raw_track_ids.append(int(box.id[0]))
+        display_track_ids = track_id_mapper.update(raw_track_ids, frame_idx)
         if boxes is not None:
             for box in boxes:
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 conf = float(box.conf[0])
+                track_id = None
+                if box.id is not None:
+                    raw_track_id = int(box.id[0])
+                    track_id = display_track_ids.get(raw_track_id)
                 angle_deg = math.degrees(
                     math.atan(((0.5 * (x1 + x2)) - frame_w * 0.5) / focal_px_x)
                 )
@@ -429,7 +482,8 @@ def main() -> None:
                 p1 = (int(x1), int(y1))
                 p2 = (int(x2), int(y2))
                 cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
-                label = f"person {conf:.2f} {dist_text} {angle_deg:+.1f}deg"
+                person_name = f"person {track_id}" if track_id is not None else "person"
+                label = f"{person_name} {conf:.2f} {dist_text} {angle_deg:+.1f}deg"
                 text_org = (p1[0], max(20, p1[1] - 8))
                 cv2.putText(
                     annotated,
