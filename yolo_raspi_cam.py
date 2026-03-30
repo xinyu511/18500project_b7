@@ -343,10 +343,12 @@ class TrackIdMapper:
         self.next_display_id = next_id + 1
         return next_id
 
-    def _match_display_id(self, hist, cx: float, cy: float, frame_diag: float):
+    def _match_display_id(self, hist, cx: float, cy: float, frame_diag: float, used_ids: set[int]):
         best_id = None
         best_score = float("inf")
         for disp_id, model in self.display_models.items():
+            if disp_id in used_ids:
+                continue
             sim = color_similarity(hist, model.get("hist"))
             color_term = 1.0 - sim
             pos_term = min(
@@ -363,6 +365,7 @@ class TrackIdMapper:
     def update(self, detections: list[dict], frame_idx: int, frame_w: int, frame_h: int) -> list[int]:
         frame_diag = max(1.0, math.hypot(frame_w, frame_h))
         assigned_display_ids: list[int] = []
+        used_ids: set[int] = set()
 
         for det in detections:
             raw_id = det["raw_track_id"]
@@ -374,11 +377,15 @@ class TrackIdMapper:
             if raw_id is not None and raw_id in self.raw_to_display:
                 candidate = self.raw_to_display[raw_id]
                 model = self.display_models.get(candidate)
-                if model is not None and frame_idx - model.get("last_seen", frame_idx) <= self.max_missing_frames:
+                if (
+                    model is not None
+                    and candidate not in used_ids
+                    and frame_idx - model.get("last_seen", frame_idx) <= self.max_missing_frames
+                ):
                     display_id = candidate
 
             if display_id is None:
-                display_id = self._match_display_id(hist, cx, cy, frame_diag)
+                display_id = self._match_display_id(hist, cx, cy, frame_diag, used_ids)
 
             if display_id is None:
                 display_id = self._alloc_display_id()
@@ -409,6 +416,7 @@ class TrackIdMapper:
             if raw_id is not None:
                 self.raw_to_display[raw_id] = display_id
             assigned_display_ids.append(display_id)
+            used_ids.add(display_id)
 
         stale_displays = [
             disp_id
