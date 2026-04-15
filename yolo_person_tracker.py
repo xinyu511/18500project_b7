@@ -155,10 +155,15 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-# ── main ───────────────────────────────────────────────────────────────────────
-def main() -> None:
-    args = parse_args()
+# ── main loop (importable) ────────────────────────────────────────────────────
+def run_pipeline(args, on_vision=None) -> None:
+    """
+    Run the vision pipeline.
 
+    on_vision: optional callable invoked each frame with keyword arguments:
+                 on_vision(user_distance, x_offset, target_lost)
+               If None, vision output is only printed to stdout.
+    """
     # Try eYs3D SDK first; fall back to V4L2 monocular
     sdk_result = try_open_eys3d(args.sdk_home, args.cam_width, args.cam_height, args.cam_fps)
 
@@ -185,104 +190,109 @@ def main() -> None:
 
     print("SafeFollow running. Press q to quit.")
 
-    while True:
-        # ── grab frames ───────────────────────────────────────────────────────
+    try:
+        while True:
+            # ── grab frames ───────────────────────────────────────────────────
+            if depth_mode == "stereo":
+                color_frame = get_color()
+                depth_m     = get_depth()
+                if color_frame is None:
+                    print("SDK color frame failed; stopping.")
+                    break
+            else:
+                ok, color_frame = v4l2_cap.read()
+                if not ok:
+                    print("Camera frame grab failed; stopping.")
+                    break
+                depth_m = None
+
+            # ── YOLO person tracking ───────────────────────────────────────────
+            results = model.track(
+                source=color_frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=[PERSON_CLASS],
+                persist=True,
+                tracker="bytetrack_safefollow.yaml",
+                verbose=False,
+                device="cpu",
+            )
+
+            boxes     = results[0].boxes
+            n_persons = len(boxes) if boxes is not None else 0
+            loss_tracker.update(n_persons > 0)
+
+            # ── pick closest person as target ──────────────────────────────────
+            user_distance = float("inf")
+            x_offset      = 0.0
+            target_id     = -1
+
+            if n_persons > 0:
+                ids = boxes.id
+                for i, box in enumerate(boxes.xyxy):
+                    x1, y1, x2, y2 = (int(v) for v in box.tolist())
+
+                    if depth_m is not None:
+                        dist = median_depth_in_box(depth_m, x1, y1, x2, y2)
+                    else:
+                        dist = monocular_distance(y2 - y1, focal_px)
+
+                    if dist < user_distance:
+                        user_distance = dist
+                        x_offset  = ((x1 + x2) / 2.0 - frame_cx) / frame_cx
+                        target_id = int(ids[i]) if ids is not None else -1
+
+            # ── annotate ──────────────────────────────────────────────────────
+            annotated = results[0].plot()
+
+            if user_distance < float("inf"):
+                cv2.putText(annotated,
+                    f"ID{target_id}  {user_distance:.2f}m  offset={x_offset:+.2f}  [{depth_mode}]",
+                    (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+
+            if loss_tracker.lost:
+                cv2.putText(annotated, "TARGET LOST — SEARCH",
+                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+            now = time.time()
+            dt  = now - prev_time
+            prev_time = now
+            if dt > 0:
+                fps = 0.9 * fps + 0.1 / dt if fps > 0 else 1.0 / dt
+
+            cv2.putText(annotated, f"FPS: {fps:.1f}",
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # ── call motor controller ──────────────────────────────────────────
+            if on_vision is not None:
+                on_vision(
+                    user_distance=user_distance,
+                    x_offset=x_offset,
+                    target_lost=loss_tracker.lost,
+                )
+
+            if args.show:
+                cv2.imshow("SafeFollow", annotated)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+            else:
+                now_sec = int(now)
+                if now_sec != last_log_sec:
+                    print(f"FPS={fps:.1f}  persons={n_persons}"
+                          f"  dist={user_distance:.2f}m  x_off={x_offset:+.2f}"
+                          f"  {'LOST' if loss_tracker.lost else 'OK'}")
+                    last_log_sec = now_sec
+
+    finally:
         if depth_mode == "stereo":
-            color_frame = get_color()
-            depth_m     = get_depth()
-            if color_frame is None:
-                print("SDK color frame failed; stopping.")
-                break
+            pipe.stop()
         else:
-            ok, color_frame = v4l2_cap.read()
-            if not ok:
-                print("Camera frame grab failed; stopping.")
-                break
-            depth_m = None
+            v4l2_cap.release()
+        cv2.destroyAllWindows()
 
-        # ── YOLO person tracking ───────────────────────────────────────────────
-        results = model.track(
-            source=color_frame,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            classes=[PERSON_CLASS],
-            persist=True,
-            tracker="bytetrack_safefollow.yaml",
-            verbose=False,
-            device="cpu",
-        )
 
-        boxes     = results[0].boxes
-        n_persons = len(boxes) if boxes is not None else 0
-        loss_tracker.update(n_persons > 0)
-
-        # ── pick closest person as target ──────────────────────────────────────
-        user_distance = float("inf")
-        x_offset      = 0.0
-        target_id     = -1
-
-        if n_persons > 0:
-            ids = boxes.id
-            for i, box in enumerate(boxes.xyxy):
-                x1, y1, x2, y2 = (int(v) for v in box.tolist())
-
-                if depth_m is not None:
-                    dist = median_depth_in_box(depth_m, x1, y1, x2, y2)
-                else:
-                    dist = monocular_distance(y2 - y1, focal_px)
-
-                if dist < user_distance:
-                    user_distance = dist
-                    x_offset  = ((x1 + x2) / 2.0 - frame_cx) / frame_cx
-                    target_id = int(ids[i]) if ids is not None else -1
-
-        # ── annotate ───────────────────────────────────────────────────────────
-        annotated = results[0].plot()
-
-        if user_distance < float("inf"):
-            cv2.putText(annotated,
-                f"ID{target_id}  {user_distance:.2f}m  offset={x_offset:+.2f}  [{depth_mode}]",
-                (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
-
-        if loss_tracker.lost:
-            cv2.putText(annotated, "TARGET LOST — SEARCH",
-                (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
-
-        now = time.time()
-        dt  = now - prev_time
-        prev_time = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 / dt if fps > 0 else 1.0 / dt
-
-        cv2.putText(annotated, f"FPS: {fps:.1f}",
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-
-        # ── motion controller output ───────────────────────────────────────────
-        vision_output = {
-            "user_distance": user_distance,   # metres
-            "x_offset":      x_offset,        # normalised [-1, +1]
-            "track_id":      target_id,
-            "target_lost":   loss_tracker.lost,
-        }
-        # e.g. control_queue.put(vision_output)
-
-        if args.show:
-            cv2.imshow("SafeFollow", annotated)
-            if (cv2.waitKey(1) & 0xFF) == ord("q"):
-                break
-        else:
-            now_sec = int(now)
-            if now_sec != last_log_sec:
-                print(f"FPS={fps:.1f}  persons={n_persons}"
-                      f"  dist={user_distance:.2f}m  x_off={x_offset:+.2f}"
-                      f"  {'LOST' if loss_tracker.lost else 'OK'}")
-                last_log_sec = now_sec
-
-    if depth_mode == "stereo":
-        pipe.stop()
-    else:
-        v4l2_cap.release()
-    cv2.destroyAllWindows()
+def main() -> None:
+    run_pipeline(parse_args())
 
 
 if __name__ == "__main__":
