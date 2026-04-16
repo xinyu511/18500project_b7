@@ -748,11 +748,32 @@ def run_pipeline(args, on_vision=None) -> None:
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
             else:
+                # Per-frame vision log (mirrors [ctrl] cadence from motor_ctrl)
+                if target_det is not None:
+                    mode = "bbox" if target_det["dist_is_fallback"] else "stereo"
+                    bbox_w = int(target_det["x2"] - target_det["x1"])
+                    bbox_h = int(target_det["y2"] - target_det["y1"])
+                    others = [d for d in detections if d is not target_det]
+                    others_str = (", ".join(
+                        f"#{d['display_id']}@{d['distance_m']:.1f}m"
+                        for d in others
+                    ) if others else "-")
+                    print(f"[vision] n={len(detections)} "
+                          f"target=#{target_det['display_id']} "
+                          f"dist={target_det['distance_m']:.2f}m[{mode}] "
+                          f"angle={target_det['angle_deg']:+.1f}° "
+                          f"off={last_known_offset:+.2f} "
+                          f"bbox={bbox_w}x{bbox_h} "
+                          f"conf={target_det['conf']:.2f} "
+                          f"others=[{others_str}]")
+                else:
+                    status = "LOST" if loss_tracker.lost else "searching"
+                    print(f"[vision] n={len(detections)} target=none [{status}]")
+
+                # FPS heartbeat once per second
                 now_sec = int(now)
                 if now_sec != last_logged_sec:
-                    print(f"FPS: {fps:.1f}  {lock_str}  "
-                          f"dist={last_known_distance:.2f}m  "
-                          f"off={last_known_offset:+.2f}")
+                    print(f"[fps  ] {fps:.1f} Hz  frame={frame_idx}  {lock_str}")
                     last_logged_sec = now_sec
     finally:
         cap.release()
