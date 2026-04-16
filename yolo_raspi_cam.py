@@ -10,7 +10,11 @@ from ultralytics import YOLO
 H_BINS = 24
 S_BINS = 16
 OVERLAP_IOU_THRESHOLD = 0.20
-TARGET_LOSS_FRAMES = 10   # consecutive missing-target frames before SEARCH
+TARGET_LOSS_FRAMES    = 10   # consecutive missing-target frames before SEARCH
+FAST_RELOCK_FRAMES    = 8    # if locked ID missing this long AND people are visible,
+                             # release the lock immediately (handles ID-change events
+                             # e.g. person moved very close to the camera)
+DEDUP_IOU_THRESHOLD   = 0.60 # merge duplicate YOLO boxes (same person, two detections)
 
 
 class TargetLossTracker:
@@ -365,6 +369,20 @@ def bbox_iou(box_a: tuple[float, float, float, float], box_b: tuple[float, float
     return inter / denom if denom > 0 else 0.0
 
 
+def dedup_overlapping(detections: list[dict], iou_thresh: float = DEDUP_IOU_THRESHOLD) -> list[dict]:
+    """Drop duplicate YOLO boxes (same person detected twice) via NMS-style filter.
+    Keeps the higher-confidence detection when two boxes overlap above the threshold."""
+    sorted_dets = sorted(detections, key=lambda d: -d["conf"])
+    kept: list[dict] = []
+    for det in sorted_dets:
+        box = (det["x1"], det["y1"], det["x2"], det["y2"])
+        if any(bbox_iou(box, (k["x1"], k["y1"], k["x2"], k["y2"])) > iou_thresh
+               for k in kept):
+            continue
+        kept.append(det)
+    return kept
+
+
 class TrackIdMapper:
     """Hybrid tracker+appearance mapping to compact, stable display IDs."""
 
@@ -593,6 +611,7 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
     locked_id: int | None = None
     last_known_distance = 1.25
     last_known_offset   = 0.0
+    frames_since_target = 0   # counter for fast-relock
 
     print("Running detection. Press 'q' in preview window to quit.")
     try:
@@ -667,6 +686,9 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                         "cx": cx, "cy": cy, "hist": hist,
                     })
 
+            # Drop duplicate YOLO boxes (same person detected twice with high IoU)
+            detections = dedup_overlapping(detections)
+
             display_ids = track_id_mapper.update(detections, frame_idx, frame_w, frame_h)
 
             # Enrich detections with distance + angle + display_id
@@ -690,8 +712,27 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                 # Release lock if the target has been purged by the mapper
                 # (happens after TrackIdMapper.max_missing_frames ≈ 45 frames)
                 if target_det is None and locked_id not in track_id_mapper.display_models:
-                    print(f"[vision] Lost target ID {locked_id} — releasing lock")
+                    print(f"[vision] Lost target ID {locked_id} — releasing lock (purged)")
                     locked_id = None
+
+            # Update miss counter for fast-relock
+            if target_det is not None:
+                frames_since_target = 0
+            else:
+                frames_since_target += 1
+
+            # Fast re-lock: if locked target has been missing for FAST_RELOCK_FRAMES
+            # AND at least one person is visible, assume an ID-change event
+            # (e.g. person moved very close, ByteTrack dropped them, new display_id
+            # was allocated) and release the stale lock so we can re-acquire.
+            if (locked_id is not None and target_det is None
+                    and len(detections) > 0
+                    and frames_since_target >= FAST_RELOCK_FRAMES):
+                print(f"[vision] Fast re-lock: ID {locked_id} missed for "
+                      f"{frames_since_target} frames, {len(detections)} person(s) "
+                      f"visible — releasing lock")
+                locked_id = None
+                frames_since_target = 0
 
             if locked_id is None and len(detections) > 0:
                 # Initial / re-acquisition: lock onto the closest person
