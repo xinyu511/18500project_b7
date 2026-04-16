@@ -10,11 +10,31 @@ from ultralytics import YOLO
 H_BINS = 24
 S_BINS = 16
 OVERLAP_IOU_THRESHOLD = 0.20
+TARGET_LOSS_FRAMES = 10   # consecutive missing-target frames before SEARCH
 
 
-def parse_args() -> argparse.Namespace:
+class TargetLossTracker:
+    """Declares the locked target 'lost' after N consecutive missed frames."""
+
+    def __init__(self, threshold: int = TARGET_LOSS_FRAMES):
+        self.threshold   = threshold
+        self._miss_count = 0
+        self.lost        = False
+
+    def update(self, detected: bool) -> None:
+        if detected:
+            self._miss_count = 0
+            self.lost        = False
+        else:
+            self._miss_count += 1
+            if self._miss_count >= self.threshold:
+                self.lost = True
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run tiny YOLO on Raspberry Pi camera (/dev/video0)."
+        description="Run tiny YOLO on Raspberry Pi camera (/dev/video0).",
+        add_help=False,   # allow use as parents=[...] in main.py
     )
     parser.add_argument("--device", default="/dev/video0", help="V4L2 camera device")
     parser.add_argument(
@@ -151,7 +171,14 @@ def parse_args() -> argparse.Namespace:
         help="Assumed real person height in meters (for distance estimate)",
     )
     parser.add_argument("--show", action="store_true", help="Show annotated preview window")
-    return parser.parse_args()
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    return argparse.ArgumentParser(
+        parents=[build_parser()],
+        description="Run tiny YOLO on Raspberry Pi camera (/dev/video0).",
+    ).parse_args()
 
 
 def estimate_distance_and_angle(
@@ -481,9 +508,48 @@ class TrackIdMapper:
         return assigned_display_ids
 
 
-def main() -> None:
-    args = parse_args()
+def _compute_distance_for_det(det: dict, args, disparity_for_sampling, focal_px_x,
+                              frame_w: int, frame_h: int) -> tuple[float, bool]:
+    """Return (distance_m, is_fallback). Tries stereo first, falls back to bbox."""
+    x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
 
+    if args.distance_mode == "stereo" and disparity_for_sampling is not None:
+        dist = sample_depth_from_disparity(
+            disparity_map=disparity_for_sampling,
+            x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2),
+            focal_px=focal_px_x, baseline_m=args.baseline_m,
+            min_depth_m=args.min_depth_m, max_depth_m=args.max_depth_m,
+        )
+        if dist is not None:
+            dist = args.depth_scale * dist - args.depth_offset
+            if dist < args.min_depth_m or dist > args.max_depth_m:
+                dist = None
+        if dist is not None:
+            return dist, False
+
+    # bbox-height fallback
+    dist, _ = estimate_distance_and_angle(
+        x1=x1, y1=y1, x2=x2, y2=y2,
+        frame_w=frame_w, frame_h=frame_h,
+        hfov_deg=args.hfov_deg, vfov_deg=args.vfov_deg,
+        person_height_m=args.person_height_m,
+    )
+    return dist, True
+
+
+def run_pipeline(args, on_vision=None) -> None:
+    """
+    Run the vision pipeline.
+
+    on_vision: optional callable invoked each frame with keyword arguments:
+                 on_vision(user_distance, x_offset, target_lost)
+               user_distance is metres, x_offset is normalised [-1, +1]
+               (left = -1, centre = 0, right = +1), target_lost is bool.
+
+    Target selection: locks onto one person (by stable display_id from
+    TrackIdMapper). On initial acquisition — or when the locked target has
+    been purged from the mapper — picks the closest person as the new lock.
+    """
     cap = cv2.VideoCapture(args.device, cv2.CAP_V4L2)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera device: {args.device}")
@@ -517,198 +583,186 @@ def main() -> None:
     disparity_for_sampling = None
     track_id_mapper = TrackIdMapper()
 
+    # Target-following state
+    loss_tracker        = TargetLossTracker()
+    locked_id: int | None = None
+    last_known_distance = 1.25
+    last_known_offset   = 0.0
+
     print("Running detection. Press 'q' in preview window to quit.")
-    while True:
-        frame_idx += 1
-        if args.distance_mode == "stereo":
-            ok, left_frame, right_frame = get_stereo_frames(args, cap, cap_right)
-            frame = left_frame
-        else:
-            ok, frame = cap.read()
-            right_frame = None
-        if not ok:
-            print("Frame grab failed; stopping.")
-            break
-
-        results = model.track(
-            source=frame,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            classes=[0],  # person only (COCO class id 0)
-            verbose=False,
-            device="cpu",
-            persist=True,
-            tracker="bytetrack.yaml",
-        )
-
-        annotated = frame.copy()
-        frame_h, frame_w = annotated.shape[:2]
-        focal_px_x = (frame_w * 0.5) / math.tan(math.radians(args.hfov_deg) * 0.5)
-        disparity_vis = None
-        if args.distance_mode == "stereo":
-            scale = max(0.2, min(1.0, args.stereo_proc_scale))
-            refresh_every = max(1, args.disp_every)
-            if disparity_for_sampling is None or frame_idx % refresh_every == 0:
-                left_small = cv2.resize(
-                    left_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-                )
-                right_small = cv2.resize(
-                    right_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
-                )
-                gray_l = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
-                gray_r = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
-                if args.stereo_algo == "bm":
-                    gray_l = cv2.equalizeHist(gray_l)
-                    gray_r = cv2.equalizeHist(gray_r)
-                disparity_small = stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
-                # Disparity is measured in the downscaled image pixel units.
-                # Convert to full-resolution pixel disparity before depth conversion.
-                disparity_small /= scale
-                disparity_small = cv2.medianBlur(disparity_small, 5)
-                disparity_for_sampling = cv2.resize(
-                    disparity_small, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR
-                )
-                if args.show_disparity:
-                    disp_norm = cv2.normalize(
-                        disparity_small, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
-                    )
-                    disparity_vis = disp_norm.astype(np.uint8)
-
-        boxes = results[0].boxes
-        person_count = 0
-        detections: list[dict] = []
-        if boxes is not None:
-            for box in boxes:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                raw_track_id = int(box.id[0]) if box.id is not None else None
-                cx = 0.5 * (x1 + x2)
-                cy = 0.5 * (y1 + y2)
-                hist = person_color_histogram(frame, int(x1), int(y1), int(x2), int(y2))
-                detections.append(
-                    {
-                        "x1": x1,
-                        "y1": y1,
-                        "x2": x2,
-                        "y2": y2,
-                        "conf": conf,
-                        "raw_track_id": raw_track_id,
-                        "cx": cx,
-                        "cy": cy,
-                        "hist": hist,
-                    }
-                )
-
-        display_ids = track_id_mapper.update(detections, frame_idx, frame_w, frame_h)
-
-        for det, track_id in zip(detections, display_ids):
-                x1 = det["x1"]
-                y1 = det["y1"]
-                x2 = det["x2"]
-                y2 = det["y2"]
-                conf = det["conf"]
-                angle_deg = math.degrees(
-                    math.atan(((0.5 * (x1 + x2)) - frame_w * 0.5) / focal_px_x)
-                )
-                if args.distance_mode == "stereo" and disparity_for_sampling is not None:
-                    distance_m = sample_depth_from_disparity(
-                        disparity_map=disparity_for_sampling,
-                        x1=int(x1),
-                        y1=int(y1),
-                        x2=int(x2),
-                        y2=int(y2),
-                        focal_px=focal_px_x,
-                        baseline_m=args.baseline_m,
-                        min_depth_m=args.min_depth_m,
-                        max_depth_m=args.max_depth_m,
-                    )
-
-                    if distance_m is not None:
-                        distance_m = args.depth_scale * distance_m - args.depth_offset
-                        if distance_m < args.min_depth_m or distance_m > args.max_depth_m:
-                            distance_m = None
-
-                    if distance_m is None:
-                        distance_m, _ = estimate_distance_and_angle(
-                            x1=x1,
-                            y1=y1,
-                            x2=x2,
-                            y2=y2,
-                            frame_w=frame_w,
-                            frame_h=frame_h,
-                            hfov_deg=args.hfov_deg,
-                            vfov_deg=args.vfov_deg,
-                            person_height_m=args.person_height_m,
-                        )
-                        dist_text = f"~{distance_m:.2f}m"
-                    else:
-                        dist_text = f"{distance_m:.2f}m"
-                else:
-                    distance_m, _ = estimate_distance_and_angle(
-                        x1=x1,
-                        y1=y1,
-                        x2=x2,
-                        y2=y2,
-                        frame_w=frame_w,
-                        frame_h=frame_h,
-                        hfov_deg=args.hfov_deg,
-                        vfov_deg=args.vfov_deg,
-                        person_height_m=args.person_height_m,
-                    )
-                    dist_text = f"{distance_m:.2f}m"
-                person_count += 1
-
-                p1 = (int(x1), int(y1))
-                p2 = (int(x2), int(y2))
-                cv2.rectangle(annotated, p1, p2, (0, 255, 0), 2)
-                person_name = f"person {track_id}" if track_id is not None else "person"
-                label = f"{person_name} {conf:.2f} {dist_text} {angle_deg:+.1f}deg"
-                text_org = (p1[0], max(20, p1[1] - 8))
-                cv2.putText(
-                    annotated,
-                    label,
-                    text_org,
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        now = time.time()
-        dt = now - prev_time
-        prev_time = now
-        if dt > 0:
-            fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
-
-        cv2.putText(
-            annotated,
-            f"FPS: {fps:.1f}  persons: {person_count}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
-        if args.show:
-            cv2.imshow("YOLO (Raspberry Pi)", annotated)
-            if args.show_disparity and disparity_vis is not None:
-                cv2.imshow("Disparity", disparity_vis)
-            if (cv2.waitKey(1) & 0xFF) == ord("q"):
+    try:
+        while True:
+            frame_idx += 1
+            if args.distance_mode == "stereo":
+                ok, left_frame, right_frame = get_stereo_frames(args, cap, cap_right)
+                frame = left_frame
+            else:
+                ok, frame = cap.read()
+                right_frame = None
+            if not ok:
+                print("Frame grab failed; stopping.")
                 break
-        else:
-            # In headless mode, print a heartbeat every ~1 second.
-            now_sec = int(now)
-            if now_sec != last_logged_sec:
-                print(f"FPS: {fps:.1f}")
-                last_logged_sec = now_sec
 
-    cap.release()
-    if cap_right is not None:
-        cap_right.release()
-    cv2.destroyAllWindows()
+            results = model.track(
+                source=frame,
+                imgsz=args.imgsz,
+                conf=args.conf,
+                classes=[0],  # person only (COCO class id 0)
+                verbose=False,
+                device="cpu",
+                persist=True,
+                tracker="bytetrack.yaml",
+            )
+
+            annotated = frame.copy()
+            frame_h, frame_w = annotated.shape[:2]
+            focal_px_x = (frame_w * 0.5) / math.tan(math.radians(args.hfov_deg) * 0.5)
+            half_hfov  = args.hfov_deg * 0.5
+            disparity_vis = None
+            if args.distance_mode == "stereo":
+                scale = max(0.2, min(1.0, args.stereo_proc_scale))
+                refresh_every = max(1, args.disp_every)
+                if disparity_for_sampling is None or frame_idx % refresh_every == 0:
+                    left_small = cv2.resize(
+                        left_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+                    )
+                    right_small = cv2.resize(
+                        right_frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+                    )
+                    gray_l = cv2.cvtColor(left_small, cv2.COLOR_BGR2GRAY)
+                    gray_r = cv2.cvtColor(right_small, cv2.COLOR_BGR2GRAY)
+                    if args.stereo_algo == "bm":
+                        gray_l = cv2.equalizeHist(gray_l)
+                        gray_r = cv2.equalizeHist(gray_r)
+                    disparity_small = stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
+                    disparity_small /= scale
+                    disparity_small = cv2.medianBlur(disparity_small, 5)
+                    disparity_for_sampling = cv2.resize(
+                        disparity_small, (frame_w, frame_h), interpolation=cv2.INTER_LINEAR
+                    )
+                    if args.show_disparity:
+                        disp_norm = cv2.normalize(
+                            disparity_small, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX
+                        )
+                        disparity_vis = disp_norm.astype(np.uint8)
+
+            boxes = results[0].boxes
+            detections: list[dict] = []
+            if boxes is not None:
+                for box in boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    conf = float(box.conf[0])
+                    raw_track_id = int(box.id[0]) if box.id is not None else None
+                    cx = 0.5 * (x1 + x2)
+                    cy = 0.5 * (y1 + y2)
+                    hist = person_color_histogram(frame, int(x1), int(y1), int(x2), int(y2))
+                    detections.append({
+                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                        "conf": conf, "raw_track_id": raw_track_id,
+                        "cx": cx, "cy": cy, "hist": hist,
+                    })
+
+            display_ids = track_id_mapper.update(detections, frame_idx, frame_w, frame_h)
+
+            # Enrich detections with distance + angle + display_id
+            for det, did in zip(detections, display_ids):
+                det["display_id"] = did
+                det["angle_deg"]  = math.degrees(
+                    math.atan(((0.5 * (det["x1"] + det["x2"])) - frame_w * 0.5) / focal_px_x)
+                )
+                dist, fb = _compute_distance_for_det(
+                    det, args, disparity_for_sampling, focal_px_x, frame_w, frame_h
+                )
+                det["distance_m"]  = dist
+                det["dist_is_fallback"] = fb
+
+            # ── target selection ──────────────────────────────────────────
+            target_det = None
+            if locked_id is not None:
+                target_det = next(
+                    (d for d in detections if d["display_id"] == locked_id), None
+                )
+                # Release lock if the target has been purged by the mapper
+                # (happens after TrackIdMapper.max_missing_frames ≈ 45 frames)
+                if target_det is None and locked_id not in track_id_mapper.display_models:
+                    print(f"[vision] Lost target ID {locked_id} — releasing lock")
+                    locked_id = None
+
+            if locked_id is None and len(detections) > 0:
+                # Initial / re-acquisition: lock onto the closest person
+                target_det = min(detections, key=lambda d: d["distance_m"])
+                locked_id = target_det["display_id"]
+                print(f"[vision] Locked onto target ID {locked_id}")
+
+            loss_tracker.update(detected=(target_det is not None))
+
+            if target_det is not None:
+                last_known_distance = target_det["distance_m"]
+                # Convert angle → normalised x_offset using half-HFOV
+                last_known_offset = max(-1.0, min(1.0,
+                    target_det["angle_deg"] / half_hfov
+                ))
+
+            # ── motor callback ────────────────────────────────────────────
+            if on_vision is not None:
+                on_vision(
+                    user_distance=last_known_distance,
+                    x_offset=last_known_offset,
+                    target_lost=loss_tracker.lost,
+                )
+
+            # ── annotation ────────────────────────────────────────────────
+            for det in detections:
+                is_target = (det is target_det)
+                color = (0, 255, 255) if is_target else (0, 255, 0)  # yellow / green
+                p1 = (int(det["x1"]), int(det["y1"]))
+                p2 = (int(det["x2"]), int(det["y2"]))
+                cv2.rectangle(annotated, p1, p2, color, 2)
+                dist_text = (f"~{det['distance_m']:.2f}m" if det["dist_is_fallback"]
+                             else f"{det['distance_m']:.2f}m")
+                person_name = (f"person {det['display_id']}"
+                               if det["display_id"] is not None else "person")
+                label = (f"{person_name} {det['conf']:.2f} "
+                         f"{dist_text} {det['angle_deg']:+.1f}deg")
+                cv2.putText(annotated, label,
+                            (p1[0], max(20, p1[1] - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+
+            now = time.time()
+            dt  = now - prev_time
+            prev_time = now
+            if dt > 0:
+                fps = 0.9 * fps + 0.1 * (1.0 / dt) if fps > 0 else 1.0 / dt
+
+            lock_str = f"LOCK: {locked_id}" if locked_id is not None else "LOCK: none"
+            if loss_tracker.lost:
+                lock_str += "  [LOST]"
+            cv2.putText(annotated,
+                        f"FPS: {fps:.1f}  persons: {len(detections)}  {lock_str}",
+                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+            if args.show:
+                cv2.imshow("YOLO (Raspberry Pi)", annotated)
+                if args.show_disparity and disparity_vis is not None:
+                    cv2.imshow("Disparity", disparity_vis)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+            else:
+                now_sec = int(now)
+                if now_sec != last_logged_sec:
+                    print(f"FPS: {fps:.1f}  {lock_str}  "
+                          f"dist={last_known_distance:.2f}m  "
+                          f"off={last_known_offset:+.2f}")
+                    last_logged_sec = now_sec
+    finally:
+        cap.release()
+        if cap_right is not None:
+            cap_right.release()
+        cv2.destroyAllWindows()
+
+
+def main() -> None:
+    run_pipeline(parse_args())
 
 
 if __name__ == "__main__":
