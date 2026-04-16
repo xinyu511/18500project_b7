@@ -53,7 +53,7 @@ def main() -> None:
 
     print(f"[main] Robot IP: {args.ip}")
     print("[main] Starting vision pipeline...")
-    run_pipeline(args, on_vision=ctrl.update)
+    run_pipeline(args, on_vision=ctrl.update, status_provider=ctrl.get_status)
 
 
 if __name__ == "__main__":

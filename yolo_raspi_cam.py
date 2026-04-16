@@ -537,7 +537,7 @@ def _compute_distance_for_det(det: dict, args, disparity_for_sampling, focal_px_
     return dist, True
 
 
-def run_pipeline(args, on_vision=None) -> None:
+def run_pipeline(args, on_vision=None, status_provider=None) -> None:
     """
     Run the vision pipeline.
 
@@ -545,6 +545,11 @@ def run_pipeline(args, on_vision=None) -> None:
                  on_vision(user_distance, x_offset, target_lost)
                user_distance is metres, x_offset is normalised [-1, +1]
                (left = -1, centre = 0, right = +1), target_lost is bool.
+
+    status_provider: optional zero-arg callable that returns a dict of
+               motor-controller state to overlay on the video (when --show).
+               Expected keys: state, left_pwm, right_pwm, forward, turn,
+               dist_err, json_cmd.
 
     Target selection: locks onto one person (by stable display_id from
     TrackIdMapper). On initial acquisition — or when the locked target has
@@ -740,6 +745,63 @@ def run_pipeline(args, on_vision=None) -> None:
             cv2.putText(annotated,
                         f"FPS: {fps:.1f}  persons: {len(detections)}  {lock_str}",
                         (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # ── motor controller overlay ──────────────────────────────────
+            if status_provider is not None:
+                st = status_provider()
+                state_color = {
+                    "FOLLOW": (0, 255, 0),    # green
+                    "SEARCH": (0, 200, 255),  # orange
+                    "STOP":   (0, 0, 255),    # red
+                }.get(st["state"], (200, 200, 200))
+
+                # Stack overlay lines from bottom-left upward
+                fh = annotated.shape[0]
+                lines = [
+                    f"STATE: {st['state']}",
+                    f"JSON:  {{\"T\":1,\"L\":{st['left_pwm']:+d},\"R\":{st['right_pwm']:+d}}}",
+                    f"fwd={st['forward']:+.2f}  turn={st['turn']:+.2f}  "
+                    f"err={st['dist_err']:+.2f}m",
+                ]
+                # Draw from bottom up (last line is lowest)
+                y = fh - 12
+                for line in reversed(lines):
+                    cv2.putText(annotated, line, (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2, cv2.LINE_AA)
+                    y -= 22
+
+                # Wheel-speed bars (left/right) at bottom-right
+                bar_x     = annotated.shape[1] - 130
+                bar_top   = fh - 90
+                bar_h     = 70
+                bar_w     = 20
+                gap       = 10
+                # Background
+                cv2.rectangle(annotated, (bar_x, bar_top),
+                              (bar_x + bar_w, bar_top + bar_h), (60, 60, 60), -1)
+                cv2.rectangle(annotated, (bar_x + bar_w + gap, bar_top),
+                              (bar_x + 2 * bar_w + gap, bar_top + bar_h), (60, 60, 60), -1)
+                # Fill proportional to PWM (centre line = 0)
+                mid_y = bar_top + bar_h // 2
+                for i, pwm in enumerate([st['left_pwm'], st['right_pwm']]):
+                    col = state_color
+                    frac = max(-1.0, min(1.0, pwm / 255.0))
+                    fill_h = int(abs(frac) * (bar_h // 2))
+                    bx = bar_x + i * (bar_w + gap)
+                    if pwm >= 0:
+                        cv2.rectangle(annotated, (bx, mid_y - fill_h),
+                                      (bx + bar_w, mid_y), col, -1)
+                    else:
+                        cv2.rectangle(annotated, (bx, mid_y),
+                                      (bx + bar_w, mid_y + fill_h), col, -1)
+                # Labels
+                cv2.putText(annotated, "L", (bar_x + 4, bar_top - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(annotated, "R", (bar_x + bar_w + gap + 4, bar_top - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                # Zero line
+                cv2.line(annotated, (bar_x - 2, mid_y),
+                         (bar_x + 2 * bar_w + gap + 2, mid_y), (150, 150, 150), 1)
 
             if args.show:
                 cv2.imshow("YOLO (Raspberry Pi)", annotated)

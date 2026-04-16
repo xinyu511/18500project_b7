@@ -172,9 +172,26 @@ class FollowController:
         self.stopped      = False
         self._smooth_dist = None   # EMA-filtered distance; None until first reading
 
+        # Latest-command state (read-only snapshot for overlay / logging)
+        self.last_raw_dist    = 0.0
+        self.last_smooth_dist = 0.0
+        self.last_dist_err    = 0.0
+        self.last_forward     = 0.0
+        self.last_turn        = 0.0
+        self.last_left_pwm    = 0
+        self.last_right_pwm   = 0
+
+    def _record(self, left: int, right: int) -> None:
+        self.last_left_pwm  = left
+        self.last_right_pwm = right
+
     def update(self, user_distance: float, x_offset: float, target_lost: bool) -> None:
+        self.last_raw_dist = user_distance
+
         if self.stopped:
+            self.state = "STOP"
             self.robot.stop()
+            self._record(0, 0)
             return
 
         if target_lost:
@@ -210,6 +227,12 @@ class FollowController:
         right_pwm = _deadband(forward + turn)
 
         self.robot.set_wheels(left_pwm, right_pwm)
+        self.last_smooth_dist = self._smooth_dist
+        self.last_dist_err    = dist_error
+        self.last_forward     = forward
+        self.last_turn        = turn
+        self._record(left_pwm, right_pwm)
+
         print(f"[ctrl] FOLLOW  raw={user_distance:.2f}m  "
               f"smooth={self._smooth_dist:.2f}m  dist_err={dist_error:+.2f}m  "
               f"fwd={forward:+.3f}  turn={turn:+.3f}  "
@@ -223,16 +246,37 @@ class FollowController:
             print("[ctrl] SEARCH — rotating to find user")
         # Rotate in place: left wheel forward, right wheel backward
         self.robot.set_wheels(SEARCH_PWM, -SEARCH_PWM)
+        self.last_forward   = 0.0
+        self.last_turn      = 0.0
+        self.last_dist_err  = 0.0
+        self._record(SEARCH_PWM, -SEARCH_PWM)
 
     def safety_stop(self) -> None:
         """Call this when an obstacle is detected or stop button pressed."""
         self.stopped = True
+        self.state   = "STOP"
         self.robot.stop()
+        self._record(0, 0)
         print("[ctrl] SAFETY STOP")
 
     def resume(self) -> None:
         self.stopped = False
         print("[ctrl] Resumed")
+
+    def get_status(self) -> dict:
+        """Snapshot for overlay / telemetry."""
+        return {
+            "state":      self.state,
+            "stopped":    self.stopped,
+            "raw_dist":   self.last_raw_dist,
+            "smooth":     self.last_smooth_dist,
+            "dist_err":   self.last_dist_err,
+            "forward":    self.last_forward,
+            "turn":       self.last_turn,
+            "left_pwm":   self.last_left_pwm,
+            "right_pwm":  self.last_right_pwm,
+            "json_cmd":   {"T": 1, "L": self.last_left_pwm, "R": self.last_right_pwm},
+        }
 
 
 # ── CLI & standalone test ──────────────────────────────────────────────────────
