@@ -1,53 +1,76 @@
 #!/usr/bin/env python3
 """
-SafeFollow motor controller — UGV02 serial driver.
+SafeFollow motor controller — UGV02 HTTP driver.
 
-Reads vision pipeline output and sends JSON commands to the UGV02 ESP32 over UART/USB serial.
+Reads vision pipeline output (user_distance, x_offset, target_lost) and sends
+JSON commands to the UGV02 ESP32 over HTTP Wi-Fi.
 
 JSON command reference (Waveshare UGV02):
-  {"T":1,"L":<left>,"R":<right>}       direct wheel speeds, range -0.5 to +0.5
-  {"T":13,"X":<linear>,"Z":<angular>}  linear m/s + angular rad/s
-  {"T":0}                               emergency stop (gimbal stop — also stops base)
+  {"T":1,"L":<left>,"R":<right>}   direct wheel PWM, range -255 to +255
+                                    positive = forward, negative = backward
 
-Serial port:
-  UART via 40-pin:  /dev/ttyAMA0  (default)
-  USB cable:        /dev/ttyUSB0
+HTTP endpoint:
+  GET http://<robot_ip>/js?json=<command>
+
+Robot IP:
+  AP mode (default): 192.168.4.1
+  STA mode:          shown on OLED screen (ST line)
 """
 
 import argparse
 import json
+import queue
 import time
 import threading
 
-import serial
+import requests
 
 # ── following controller constants ────────────────────────────────────────────
-TARGET_DIST_M   = 1.25    # desired following distance (metres)
-DIST_TOLERANCE  = 0.10    # dead-band: no correction if error < this (metres)
+TARGET_DIST_M  = 1.25   # desired following distance (metres)
+DIST_TOLERANCE = 0.10   # dead-band: no correction if |error| < this (metres)
 
-# PID gains for forward/backward speed
+# PID gains for forward/backward (output in normalised [-1, +1])
 KP_DIST = 0.6
 KI_DIST = 0.05
 KD_DIST = 0.1
 
-# Proportional gain for steering (x_offset → angular velocity)
+# Proportional gain for steering (x_offset → turn contribution, normalised)
 KP_STEER = 0.5
 
-# Output clamps
-MAX_LINEAR  = 0.35   # m/s  — stay well below 0.5 (max) for safety
-MAX_ANGULAR = 0.60   # rad/s
+# PWM limits
+MAX_PWM  = 255   # full PWM range
+MIN_PWM  = 60    # minimum effective PWM — below this DC motors may stall
 
-# If target is lost, rotate slowly to search
-SEARCH_ANGULAR = 0.25
+# If target is lost, rotate in place to search
+SEARCH_PWM = 80  # rotation PWM during search (each wheel opposite sign)
+
+# Depth noise filtering
+DIST_EMA_ALPHA = 0.2   # EMA smoothing factor: lower = smoother but slower to react
+                        # 0.2 means each new reading contributes 20% of the update
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _deadband(pwm: float) -> int:
+    """
+    Convert a normalised [-1,+1] value to an integer PWM in [-MAX_PWM, +MAX_PWM].
+    Values whose absolute magnitude would fall below MIN_PWM are snapped up to
+    MIN_PWM so the motors actually turn (DC geared motors stall at very low PWM).
+    Zero is preserved as zero (robot stays stopped).
+    """
+    raw = pwm * MAX_PWM
+    if raw == 0.0:
+        return 0
+    magnitude = max(MIN_PWM, min(MAX_PWM, abs(raw)))
+    return int(magnitude if raw > 0 else -magnitude)
 
 
 class PID:
-    def __init__(self, kp: float, ki: float, kd: float, output_limit: float):
+    def __init__(self, kp: float, ki: float, kd: float, output_limit: float = 1.0):
         self.kp    = kp
         self.ki    = ki
         self.kd    = kd
         self.limit = output_limit
-        self._integral  = 0.0
+        self._integral   = 0.0
         self._prev_error = 0.0
         self._prev_time  = time.time()
 
@@ -60,8 +83,8 @@ class PID:
         now = time.time()
         dt  = max(now - self._prev_time, 1e-3)
 
-        self._integral  += error * dt
-        derivative       = (error - self._prev_error) / dt
+        self._integral += error * dt
+        derivative      = (error - self._prev_error) / dt
 
         output = self.kp * error + self.ki * self._integral + self.kd * derivative
         output = max(-self.limit, min(self.limit, output))
@@ -72,51 +95,50 @@ class PID:
 
 
 class UGV02:
-    """Thin serial wrapper for the UGV02 ESP32 sub-controller."""
+    """HTTP wrapper for the UGV02 ESP32 sub-controller."""
 
-    def __init__(self, port: str, baud: int = 115200):
-        self._ser = serial.Serial(port, baudrate=baud, dsrdtr=None, timeout=1.0)
-        self._ser.setRTS(False)
-        self._ser.setDTR(False)
-        self._lock = threading.Lock()
+    def __init__(self, ip: str, timeout: float = 0.1):
+        self._base_url  = f"http://{ip}/js"
+        self._timeout   = timeout
+        # Queue depth 1: always send the latest command, drop stale ones.
+        # This prevents the vision loop from stalling behind a slow HTTP response.
+        self._send_queue = queue.Queue(maxsize=1)
+        self._worker = threading.Thread(target=self._send_loop, daemon=True)
+        self._worker.start()
+        print(f"[motor] HTTP target: {self._base_url}")
 
-        # Start background reader so ESP32 feedback doesn't block writes
-        self._reader = threading.Thread(target=self._read_loop, daemon=True)
-        self._reader.start()
-        print(f"[motor] Serial opened: {port} @ {baud}")
+    def _send_loop(self) -> None:
+        """Background thread — drains the send queue and issues HTTP requests."""
+        while True:
+            cmd = self._send_queue.get()
+            payload = json.dumps(cmd, separators=(",", ":"))
+            # Use params= so requests URL-encodes the JSON value, matching:
+            #   curl -G --data-urlencode 'json=...' http://<ip>/js
+            try:
+                requests.get(self._base_url, params={"json": payload},
+                             timeout=self._timeout)
+            except Exception:
+                pass  # fire-and-forget — robot sends no response
 
     def _send(self, cmd: dict) -> None:
-        payload = json.dumps(cmd, separators=(",", ":")) + "\n"
-        with self._lock:
-            self._ser.write(payload.encode())
-
-    def _read_loop(self) -> None:
-        while True:
+        """Enqueue a command; if the queue is full, replace the pending item."""
+        try:
+            self._send_queue.put_nowait(cmd)
+        except queue.Full:
             try:
-                line = self._ser.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    print(f"[ugv02] {line}")
-            except Exception:
-                break
+                self._send_queue.get_nowait()
+            except queue.Empty:
+                pass
+            self._send_queue.put_nowait(cmd)
 
-    def move(self, linear: float, angular: float) -> None:
+    def set_wheels(self, left: int, right: int) -> None:
         """
-        Send T:13 velocity command.
-        linear:  forward speed in m/s  (positive = forward)
-        angular: rotation in rad/s     (positive = turn left)
+        Send T:1 direct wheel PWM command.
+        left, right: integer PWM in [-255, +255].
         """
-        linear  = max(-MAX_LINEAR,  min(MAX_LINEAR,  linear))
-        angular = max(-MAX_ANGULAR, min(MAX_ANGULAR, angular))
-        self._send({"T": 13, "X": round(linear, 4), "Z": round(angular, 4)})
-
-    def set_wheels(self, left: float, right: float) -> None:
-        """
-        Send T:1 direct wheel speed command.
-        Range -0.5 to +0.5 per wheel.
-        """
-        left  = max(-0.5, min(0.5, left))
-        right = max(-0.5, min(0.5, right))
-        self._send({"T": 1, "L": round(left, 4), "R": round(right, 4)})
+        left  = max(-255, min(255, int(left)))
+        right = max(-255, min(255, int(right)))
+        self._send({"T": 1, "L": left, "R": right})
 
     def stop(self) -> None:
         """Immediate stop."""
@@ -124,25 +146,31 @@ class UGV02:
 
     def close(self) -> None:
         self.stop()
-        time.sleep(0.1)
-        self._ser.close()
 
 
 class FollowController:
     """
-    Converts vision output → UGV02 motion commands.
+    Converts vision output → UGV02 wheel PWM commands.
 
-    State machine matches the design report:
-      FOLLOW : user visible, maintain 1.25 m distance and alignment
-      SEARCH : user lost, rotate slowly to re-acquire
-      STOP   : obstacle detected or button pressed (set externally)
+    State machine:
+      FOLLOW : user visible — maintain TARGET_DIST_M and centre alignment
+      SEARCH : user lost    — rotate slowly to re-acquire
+      STOP   : obstacle / button (set externally via safety_stop())
+
+    Normalised control scheme:
+      forward ∈ [-1, +1]  →  scaled to PWM by _deadband()
+      turn    ∈ [-1, +1]  →  differential added/subtracted per wheel
+
+      left_pwm  = _deadband(forward - turn)
+      right_pwm = _deadband(forward + turn)
     """
 
     def __init__(self, robot: UGV02):
-        self.robot   = robot
-        self.pid     = PID(KP_DIST, KI_DIST, KD_DIST, MAX_LINEAR)
-        self.state   = "FOLLOW"
-        self.stopped = False   # set True externally for safety stop
+        self.robot        = robot
+        self.pid          = PID(KP_DIST, KI_DIST, KD_DIST, output_limit=1.0)
+        self.state        = "FOLLOW"
+        self.stopped      = False
+        self._smooth_dist = None   # EMA-filtered distance; None until first reading
 
     def update(self, user_distance: float, x_offset: float, target_lost: bool) -> None:
         if self.stopped:
@@ -155,26 +183,46 @@ class FollowController:
 
         self.state = "FOLLOW"
 
-        dist_error = user_distance - TARGET_DIST_M
+        # EMA filter: dampen sudden depth spikes while tracking gradual movement.
+        # On first reading after (re-)acquisition, seed the filter directly so
+        # the robot doesn't lurch toward a stale smoothed value.
+        if self._smooth_dist is None:
+            self._smooth_dist = user_distance
+        else:
+            self._smooth_dist = (DIST_EMA_ALPHA * user_distance
+                                 + (1.0 - DIST_EMA_ALPHA) * self._smooth_dist)
 
-        # Dead-band: don't creep forward/back for small errors
+        dist_error = self._smooth_dist - TARGET_DIST_M
+
+        # Dead-band: ignore tiny distance errors
         if abs(dist_error) < DIST_TOLERANCE:
             dist_error = 0.0
             self.pid.reset()
 
-        linear  = self.pid.compute(dist_error)
-        angular = -KP_STEER * x_offset   # negative: positive offset → turn right
+        # forward: positive → move toward target (target is farther than desired)
+        forward = self.pid.compute(dist_error)
 
-        self.robot.move(linear, angular)
-        print(f"[ctrl] FOLLOW  dist_err={dist_error:+.2f}m  "
-              f"linear={linear:+.3f}  angular={angular:+.3f}")
+        # turn: negative x_offset (target left) → positive turn (turn left)
+        turn = -KP_STEER * x_offset
+        turn = max(-1.0, min(1.0, turn))
+
+        left_pwm  = _deadband(forward - turn)
+        right_pwm = _deadband(forward + turn)
+
+        self.robot.set_wheels(left_pwm, right_pwm)
+        print(f"[ctrl] FOLLOW  raw={user_distance:.2f}m  "
+              f"smooth={self._smooth_dist:.2f}m  dist_err={dist_error:+.2f}m  "
+              f"fwd={forward:+.3f}  turn={turn:+.3f}  "
+              f"L={left_pwm:+d}  R={right_pwm:+d}")
 
     def _enter_search(self) -> None:
         if self.state != "SEARCH":
-            self.state = "SEARCH"
+            self.state        = "SEARCH"
+            self._smooth_dist = None   # reset filter so reacquisition seeds fresh
             self.pid.reset()
             print("[ctrl] SEARCH — rotating to find user")
-        self.robot.move(0.0, SEARCH_ANGULAR)
+        # Rotate in place: left wheel forward, right wheel backward
+        self.robot.set_wheels(SEARCH_PWM, -SEARCH_PWM)
 
     def safety_stop(self) -> None:
         """Call this when an obstacle is detected or stop button pressed."""
@@ -189,11 +237,10 @@ class FollowController:
 
 # ── CLI & standalone test ──────────────────────────────────────────────────────
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="SafeFollow UGV02 motor controller")
-    p.add_argument("--port",  default="/dev/ttyAMA0",
-                   help="Serial port (UART: /dev/ttyAMA0, USB: /dev/ttyUSB0)")
-    p.add_argument("--baud",  type=int, default=115200)
-    p.add_argument("--test",  action="store_true",
+    p = argparse.ArgumentParser(description="SafeFollow UGV02 motor controller (HTTP)")
+    p.add_argument("--ip",   default="192.168.4.1",
+                   help="Robot IP address (AP mode: 192.168.4.1; STA mode: see OLED)")
+    p.add_argument("--test", action="store_true",
                    help="Run a quick movement test sequence instead of follow mode")
     return p.parse_args()
 
@@ -201,18 +248,18 @@ def parse_args() -> argparse.Namespace:
 def run_test(robot: UGV02) -> None:
     """Quick sanity-check: forward → stop → turn → stop."""
     print("Test: forward 1 s")
-    robot.move(0.2, 0.0);  time.sleep(1.0)
+    robot.set_wheels(100, 100);         time.sleep(1.0)
     print("Test: stop 0.5 s")
-    robot.stop();           time.sleep(0.5)
-    print("Test: turn left 1 s")
-    robot.move(0.0, 0.3);  time.sleep(1.0)
+    robot.stop();                        time.sleep(0.5)
+    print("Test: rotate left 1 s")
+    robot.set_wheels(-SEARCH_PWM, SEARCH_PWM); time.sleep(1.0)
     print("Test: stop")
     robot.stop()
 
 
 def main() -> None:
-    args = parse_args()
-    robot = UGV02(args.port, args.baud)
+    args  = parse_args()
+    robot = UGV02(args.ip)
 
     if args.test:
         try:
@@ -222,24 +269,22 @@ def main() -> None:
         return
 
     # ── integrate with vision pipeline ────────────────────────────────────────
-    # Import here so motor_ctrl.py can also run standalone (--test mode).
-    # In the full system, run both scripts and connect via a queue or shared state.
+    # In the full system connect via a multiprocessing.Queue shared with
+    # yolo_person_tracker.py, e.g.:
+    #
+    #   while True:
+    #       vision = vision_queue.get()
+    #       ctrl.update(
+    #           user_distance = vision["user_distance"],
+    #           x_offset      = vision["x_offset"],
+    #           target_lost   = vision["target_lost"],
+    #       )
+    #
     ctrl = FollowController(robot)
 
     print("Motor controller ready. Ctrl-C to stop.")
     try:
-        # Placeholder loop — replace this block with your IPC mechanism.
-        # Example using a multiprocessing.Queue shared with yolo_person_tracker.py:
-        #
-        #   while True:
-        #       vision = vision_queue.get()
-        #       ctrl.update(
-        #           user_distance = vision["user_distance"],
-        #           x_offset      = vision["x_offset"],
-        #           target_lost   = vision["target_lost"],
-        #       )
-        #
-        # For now, simulate a static target at 2 m, centred, for 5 s:
+        # Simulate: target at 2.0 m, centred, for 5 s
         print("Simulating: target at 2.0 m for 5 s (robot should move forward)")
         for _ in range(25):
             ctrl.update(user_distance=2.0, x_offset=0.0, target_lost=False)
