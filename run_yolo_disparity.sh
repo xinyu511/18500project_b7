@@ -8,8 +8,8 @@ exec python3 yolo_raspi_cam.py \
   --distance-mode stereo \
   --stereo-source sbs \
   --device /dev/video0 \
-  --stereo-width 2560 \
-  --stereo-height 720 \
+  --stereo-width 1280 \
+  --stereo-height 480 \
   --baseline-m 0.06 \
   --hfov-deg 100 \
   --vfov-deg 67.5 \
