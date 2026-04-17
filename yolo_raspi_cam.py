@@ -833,7 +833,6 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                     # direction → (dx, dy) in image coords (up = -y)
                     dirs = {
                         "front": (0, -1),
-                        "back":  (0, +1),
                         "left":  (-1, 0),
                         "right": (+1, 0),
                     }
@@ -903,8 +902,7 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                     if obs:
                         obs_str = (f"  obs=[F={obs.get('front',0):.2f} "
                                    f"L={obs.get('left',0):.2f} "
-                                   f"R={obs.get('right',0):.2f} "
-                                   f"B={obs.get('back',0):.2f}]")
+                                   f"R={obs.get('right',0):.2f}]")
 
                 # Per-frame vision log (mirrors [ctrl] cadence from motor_ctrl)
                 if target_det is not None:

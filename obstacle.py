@@ -2,14 +2,13 @@
 """
 Ultrasonic obstacle sensor wrapper.
 
-Reads four HC-SR04 sensors (front / left / right / back) in a background
+Reads three HC-SR04 sensors (front / left / right) in a background
 thread and exposes the latest cached readings via get_readings().
 
 GPIO pins (BCM numbering):
   Front:  trigger=23, echo=24
   Left:   trigger=17, echo=27
   Right:  trigger=22, echo=10
-  Back:   trigger=9,  echo=11
 """
 
 import threading
@@ -25,14 +24,13 @@ MAX_RANGE_M = 2.0
 
 
 class ObstacleSensors:
-    """Thread-safe wrapper around four ultrasonic distance sensors."""
+    """Thread-safe wrapper around three ultrasonic distance sensors."""
 
     def __init__(
         self,
         front_pins: tuple[int, int] = (23, 24),
         left_pins:  tuple[int, int] = (17, 27),
         right_pins: tuple[int, int] = (22, 10),
-        back_pins:  tuple[int, int] = (9, 11),
         max_range_m: float = MAX_RANGE_M,
     ):
         try:
@@ -56,10 +54,6 @@ class ObstacleSensors:
                 trigger=right_pins[0], echo=right_pins[1],
                 max_distance=max_range_m,
             ),
-            "back": DistanceSensor(
-                trigger=back_pins[0], echo=back_pins[1],
-                max_distance=max_range_m,
-            ),
         }
         self._max = max_range_m
 
@@ -69,7 +63,7 @@ class ObstacleSensors:
 
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-        print(f"[obstacle] 4 sensors initialised (max {max_range_m:.1f} m)")
+        print(f"[obstacle] 3 sensors initialised (max {max_range_m:.1f} m)")
 
     def _poll_loop(self) -> None:
         """Continuously read all sensors and cache the results."""
@@ -84,7 +78,7 @@ class ObstacleSensors:
             time.sleep(POLL_INTERVAL)
 
     def get_readings(self) -> dict[str, float]:
-        """Return a snapshot of all four sensor distances in metres."""
+        """Return a snapshot of all three sensor distances in metres."""
         with self._lock:
             return dict(self._readings)
 

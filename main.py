@@ -41,8 +41,6 @@ def parse_args() -> argparse.Namespace:
                    metavar=("TRIG", "ECHO"), help="Left sensor GPIO pins")
     p.add_argument("--right-pins", type=int, nargs=2, default=[22, 10],
                    metavar=("TRIG", "ECHO"), help="Right sensor GPIO pins")
-    p.add_argument("--back-pins",  type=int, nargs=2, default=[9, 11],
-                   metavar=("TRIG", "ECHO"), help="Back sensor GPIO pins")
     return p.parse_args()
 
 
@@ -59,7 +57,6 @@ def main() -> None:
                 front_pins=tuple(args.front_pins),
                 left_pins=tuple(args.left_pins),
                 right_pins=tuple(args.right_pins),
-                back_pins=tuple(args.back_pins),
             )
         except RuntimeError as e:
             print(f"[main] WARNING: {e}")

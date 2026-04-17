@@ -188,7 +188,7 @@ class FollowController:
         self.last_turn        = 0.0
         self.last_left_pwm    = 0
         self.last_right_pwm   = 0
-        self.last_obs         = {"front": 2.0, "left": 2.0, "right": 2.0, "back": 2.0}
+        self.last_obs         = {"front": 2.0, "left": 2.0, "right": 2.0}
 
     # ── internal helpers ──────────────────────────────────────────────────
 
@@ -198,7 +198,7 @@ class FollowController:
 
     def _read_obstacles(self) -> dict[str, float]:
         if self.obstacles is None:
-            return {"front": 2.0, "left": 2.0, "right": 2.0, "back": 2.0}
+            return {"front": 2.0, "left": 2.0, "right": 2.0}
         readings = self.obstacles.get_readings()
         self.last_obs = readings
         return readings
@@ -217,7 +217,6 @@ class FollowController:
         front = obs["front"]
         left  = obs["left"]
         right = obs["right"]
-        back  = obs["back"]
         state = "FOLLOW"
 
         # ── Layer 1: EMERGENCY ────────────────────────────────────────────
@@ -269,10 +268,6 @@ class FollowController:
             turn -= repulsion
             if state == "FOLLOW":
                 state = "AVOID"
-
-        # ── Back safety: don't reverse into an obstacle ───────────────────
-        if forward < 0 and back < DANGER_DIST:
-            forward = 0.0
 
         # Clamp turn to [-1, +1]
         turn = max(-1.0, min(1.0, turn))
@@ -340,7 +335,7 @@ class FollowController:
         self._record(left_pwm, right_pwm)
 
         obs_str = (f"F={obs['front']:.2f} L={obs['left']:.2f} "
-                   f"R={obs['right']:.2f} B={obs['back']:.2f}")
+                   f"R={obs['right']:.2f}")
         print(f"[ctrl] {state:6s} raw={user_distance:.2f}m  "
               f"smooth={self._smooth_dist:.2f}m  err={dist_error:+.2f}m  "
               f"fwd={forward:+.3f}  turn={turn:+.3f}  "
@@ -369,7 +364,7 @@ class FollowController:
         self._record(spd, -spd)
 
         obs_str = (f"F={obs['front']:.2f} L={obs['left']:.2f} "
-                   f"R={obs['right']:.2f} B={obs['back']:.2f}")
+                   f"R={obs['right']:.2f}")
         dir_label = "CCW" if self._search_dir > 0 else "CW"
         print(f"[ctrl] SEARCH {dir_label}  L={spd:+d} R={-spd:+d}  obs=[{obs_str}]")
 
