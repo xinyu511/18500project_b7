@@ -303,6 +303,9 @@ class FollowController:
             self.pid.reset()
 
         forward = self.pid.compute(dist_error)
+        if forward < 0.0:
+            forward = 0.0                    # never reverse — no rear camera
+            self.pid.reset()                 # clear negative integral wind-up
         turn    = -KP_STEER * x_offset
         turn    = max(-1.0, min(1.0, turn))
 
