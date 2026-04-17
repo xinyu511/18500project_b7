@@ -896,6 +896,16 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
             else:
+                # Obstacle string (if motor controller provides readings)
+                obs_str = ""
+                if status_provider is not None:
+                    obs = status_provider().get("obstacles", {})
+                    if obs:
+                        obs_str = (f"  obs=[F={obs.get('front',0):.2f} "
+                                   f"L={obs.get('left',0):.2f} "
+                                   f"R={obs.get('right',0):.2f} "
+                                   f"B={obs.get('back',0):.2f}]")
+
                 # Per-frame vision log (mirrors [ctrl] cadence from motor_ctrl)
                 if target_det is not None:
                     mode = "bbox" if target_det["dist_is_fallback"] else "stereo"
@@ -913,15 +923,18 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                           f"off={last_known_offset:+.2f} "
                           f"bbox={bbox_w}x{bbox_h} "
                           f"conf={target_det['conf']:.2f} "
-                          f"others=[{others_str}]")
+                          f"others=[{others_str}]"
+                          f"{obs_str}")
                 else:
                     status = "LOST" if loss_tracker.lost else "searching"
-                    print(f"[vision] n={len(detections)} target=none [{status}]")
+                    print(f"[vision] n={len(detections)} target=none "
+                          f"[{status}]{obs_str}")
 
                 # FPS heartbeat once per second
                 now_sec = int(now)
                 if now_sec != last_logged_sec:
-                    print(f"[fps  ] {fps:.1f} Hz  frame={frame_idx}  {lock_str}")
+                    print(f"[fps  ] {fps:.1f} Hz  frame={frame_idx}  "
+                          f"{lock_str}{obs_str}")
                     last_logged_sec = now_sec
     finally:
         cap.release()

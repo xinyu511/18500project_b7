@@ -368,6 +368,11 @@ class FollowController:
         self.last_dist_err = 0.0
         self._record(spd, -spd)
 
+        obs_str = (f"F={obs['front']:.2f} L={obs['left']:.2f} "
+                   f"R={obs['right']:.2f} B={obs['back']:.2f}")
+        dir_label = "CCW" if self._search_dir > 0 else "CW"
+        print(f"[ctrl] SEARCH {dir_label}  L={spd:+d} R={-spd:+d}  obs=[{obs_str}]")
+
     def safety_stop(self) -> None:
         self.stopped = True
         self.state   = "STOP"
