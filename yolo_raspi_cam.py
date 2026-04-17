@@ -792,37 +792,84 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                 st = status_provider()
                 state_color = {
                     "FOLLOW": (0, 255, 0),    # green
+                    "AVOID":  (0, 255, 255),  # yellow
                     "SEARCH": (0, 200, 255),  # orange
                     "STOP":   (0, 0, 255),    # red
                 }.get(st["state"], (200, 200, 200))
 
                 # Stack overlay lines from bottom-left upward
                 fh = annotated.shape[0]
+                fw = annotated.shape[1]
                 lines = [
                     f"STATE: {st['state']}",
                     f"JSON:  {{\"T\":1,\"L\":{st['left_pwm']:+d},\"R\":{st['right_pwm']:+d}}}",
                     f"fwd={st['forward']:+.2f}  turn={st['turn']:+.2f}  "
                     f"err={st['dist_err']:+.2f}m",
                 ]
-                # Draw from bottom up (last line is lowest)
                 y = fh - 12
                 for line in reversed(lines):
                     cv2.putText(annotated, line, (10, y),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, state_color, 2, cv2.LINE_AA)
                     y -= 22
 
-                # Wheel-speed bars (left/right) at bottom-right
-                bar_x     = annotated.shape[1] - 130
+                # ── obstacle radar (top-down view) ────────────────────────
+                obs = st.get("obstacles", {})
+                if obs:
+                    from motor_ctrl import DANGER_DIST, CAUTION_DIST
+                    radar_r  = 40              # radar circle radius in px
+                    radar_cx = fw - radar_r - 10
+                    radar_cy = fh - 160        # above wheel bars
+
+                    # Background circle
+                    cv2.circle(annotated, (radar_cx, radar_cy), radar_r,
+                               (40, 40, 40), -1)
+                    cv2.circle(annotated, (radar_cx, radar_cy), radar_r,
+                               (100, 100, 100), 1)
+                    # Robot dot
+                    cv2.circle(annotated, (radar_cx, radar_cy), 4,
+                               (255, 255, 255), -1)
+
+                    # Draw obstacle dots in 4 directions
+                    # direction → (dx, dy) in image coords (up = -y)
+                    dirs = {
+                        "front": (0, -1),
+                        "back":  (0, +1),
+                        "left":  (-1, 0),
+                        "right": (+1, 0),
+                    }
+                    for name, (dx, dy) in dirs.items():
+                        dist_m = obs.get(name, 2.0)
+                        # Map distance to radar radius (0m = centre, 2m = edge)
+                        frac = min(1.0, dist_m / 2.0)
+                        px = int(radar_cx + dx * frac * (radar_r - 6))
+                        py = int(radar_cy + dy * frac * (radar_r - 6))
+                        # Colour by zone
+                        if dist_m < DANGER_DIST:
+                            dot_col = (0, 0, 255)      # red
+                            dot_r = 6
+                        elif dist_m < CAUTION_DIST:
+                            dot_col = (0, 200, 255)    # orange
+                            dot_r = 5
+                        else:
+                            dot_col = (0, 255, 0)      # green
+                            dot_r = 4
+                        cv2.circle(annotated, (px, py), dot_r, dot_col, -1)
+                        # Distance label
+                        cv2.putText(annotated, f"{dist_m:.1f}",
+                                    (px - 12, py - dot_r - 3),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    dot_col, 1, cv2.LINE_AA)
+
+                # ── wheel-speed bars ──────────────────────────────────────
+                bar_x     = fw - 130
                 bar_top   = fh - 90
                 bar_h     = 70
                 bar_w     = 20
                 gap       = 10
-                # Background
                 cv2.rectangle(annotated, (bar_x, bar_top),
                               (bar_x + bar_w, bar_top + bar_h), (60, 60, 60), -1)
                 cv2.rectangle(annotated, (bar_x + bar_w + gap, bar_top),
                               (bar_x + 2 * bar_w + gap, bar_top + bar_h), (60, 60, 60), -1)
-                # Fill proportional to PWM (centre line = 0)
                 mid_y = bar_top + bar_h // 2
                 for i, pwm in enumerate([st['left_pwm'], st['right_pwm']]):
                     col = state_color
@@ -835,12 +882,10 @@ def run_pipeline(args, on_vision=None, status_provider=None) -> None:
                     else:
                         cv2.rectangle(annotated, (bx, mid_y),
                                       (bx + bar_w, mid_y + fill_h), col, -1)
-                # Labels
                 cv2.putText(annotated, "L", (bar_x + 4, bar_top - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
                 cv2.putText(annotated, "R", (bar_x + bar_w + gap + 4, bar_top - 4),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-                # Zero line
                 cv2.line(annotated, (bar_x - 2, mid_y),
                          (bar_x + 2 * bar_w + gap + 2, mid_y), (150, 150, 150), 1)
 

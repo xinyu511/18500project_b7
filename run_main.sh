@@ -27,4 +27,8 @@ exec python3 main.py \
   --conf 0.35 \
   --show \
   --show-disparity \
+  --front-pins 23 24 \
+  --left-pins  17 27 \
+  --right-pins 22 10 \
+  --back-pins  9  11 \
   "$@"

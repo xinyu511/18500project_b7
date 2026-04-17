@@ -44,6 +44,12 @@ MIN_PWM  = 60    # minimum effective PWM — below this DC motors may stall
 # If target is lost, rotate in place to search
 SEARCH_PWM = 80  # rotation PWM during search (each wheel opposite sign)
 
+# ── obstacle avoidance constants ─────────────────────────────────────────────
+DANGER_DIST   = 0.25  # metres — emergency: hard turn / stop
+CAUTION_DIST  = 0.60  # metres — start slowing + steering around
+REPULSION_K   = 0.5   # side-repulsion gain (0 = ignore sides, 1 = very strong)
+AVOID_BIAS    = 0.6   # steering bias magnitude when front is blocked
+
 # Depth noise filtering
 DIST_EMA_ALPHA = 0.2   # EMA smoothing factor: lower = smoother but slower to react
                         # 0.2 means each new reading contributes 20% of the update
@@ -150,29 +156,31 @@ class UGV02:
 
 class FollowController:
     """
-    Converts vision output → UGV02 wheel PWM commands.
+    Converts vision output → UGV02 wheel PWM commands with obstacle avoidance.
 
     State machine:
-      FOLLOW : user visible — maintain TARGET_DIST_M and centre alignment
-      SEARCH : user lost    — rotate slowly to re-acquire
-      STOP   : obstacle / button (set externally via safety_stop())
+      FOLLOW  : user visible, no dangerous obstacle — PID + steering
+      AVOID   : user visible, obstacle in path — modified steering to go around
+      SEARCH  : user lost — rotate slowly to re-acquire
+      STOP    : boxed in on 3 sides, or external safety_stop()
 
-    Normalised control scheme:
-      forward ∈ [-1, +1]  →  scaled to PWM by _deadband()
-      turn    ∈ [-1, +1]  →  differential added/subtracted per wheel
-
-      left_pwm  = _deadband(forward - turn)
-      right_pwm = _deadband(forward + turn)
+    Obstacle avoidance (3 priority layers applied per frame):
+      Layer 1  EMERGENCY   front < DANGER_DIST → hard turn or full stop
+      Layer 2  AVOIDANCE   front < CAUTION_DIST → slow down + steer around
+                           side  < CAUTION_DIST → repulsive steering bias
+      Layer 3  BASE        PID distance + proportional steering (unmodified)
     """
 
-    def __init__(self, robot: UGV02):
+    def __init__(self, robot: UGV02, obstacle_sensors=None):
         self.robot        = robot
+        self.obstacles    = obstacle_sensors   # None = no avoidance
         self.pid          = PID(KP_DIST, KI_DIST, KD_DIST, output_limit=1.0)
         self.state        = "FOLLOW"
         self.stopped      = False
-        self._smooth_dist = None   # EMA-filtered distance; None until first reading
+        self._smooth_dist = None
+        self._search_dir  = 1   # +1 = left, -1 = right (flipped by obstacles)
 
-        # Latest-command state (read-only snapshot for overlay / logging)
+        # Latest-command snapshot (overlay / logging)
         self.last_raw_dist    = 0.0
         self.last_smooth_dist = 0.0
         self.last_dist_err    = 0.0
@@ -180,13 +188,102 @@ class FollowController:
         self.last_turn        = 0.0
         self.last_left_pwm    = 0
         self.last_right_pwm   = 0
+        self.last_obs         = {"front": 2.0, "left": 2.0, "right": 2.0, "back": 2.0}
+
+    # ── internal helpers ──────────────────────────────────────────────────
 
     def _record(self, left: int, right: int) -> None:
         self.last_left_pwm  = left
         self.last_right_pwm = right
 
+    def _read_obstacles(self) -> dict[str, float]:
+        if self.obstacles is None:
+            return {"front": 2.0, "left": 2.0, "right": 2.0, "back": 2.0}
+        readings = self.obstacles.get_readings()
+        self.last_obs = readings
+        return readings
+
+    def _apply_avoidance(self, forward: float, turn: float,
+                         x_offset: float, obs: dict) -> tuple[float, float, str]:
+        """
+        Modify forward/turn based on obstacle readings.
+        Returns (forward, turn, state_label).
+
+        Priority:
+          1. EMERGENCY — front danger zone
+          2. FRONT CAUTION — slow down + bias around
+          3. SIDE REPULSION — push away from close walls
+        """
+        front = obs["front"]
+        left  = obs["left"]
+        right = obs["right"]
+        back  = obs["back"]
+        state = "FOLLOW"
+
+        # ── Layer 1: EMERGENCY ────────────────────────────────────────────
+        if front < DANGER_DIST:
+            if left < DANGER_DIST and right < DANGER_DIST:
+                # Boxed in from three sides → full stop
+                return 0.0, 0.0, "STOP"
+
+            # Hard turn toward the clearest side
+            forward = 0.0
+            if left >= right:
+                turn = +1.0
+            else:
+                turn = -1.0
+            return forward, turn, "AVOID"
+
+        # ── Layer 2: FRONT CAUTION — slow down + steer around ─────────────
+        if front < CAUTION_DIST:
+            state = "AVOID"
+            # Scale forward proportionally: full at CAUTION, zero at DANGER
+            scale = (front - DANGER_DIST) / (CAUTION_DIST - DANGER_DIST)
+            forward *= max(0.0, scale)
+
+            # Steer bias: prefer the side closest to the person so the robot
+            # arcs TOWARD the target, not away from it.
+            if x_offset < 0 and left > DANGER_DIST:
+                # Person is left, left is clear → go left
+                bias = +AVOID_BIAS
+            elif x_offset >= 0 and right > DANGER_DIST:
+                # Person is right, right is clear → go right
+                bias = -AVOID_BIAS
+            elif left >= right:
+                bias = +AVOID_BIAS
+            else:
+                bias = -AVOID_BIAS
+            turn += bias
+
+        # ── Layer 3: SIDE REPULSION — always active ───────────────────────
+        if right < CAUTION_DIST:
+            # Right wall close → push left
+            repulsion = REPULSION_K * (1.0 - right / CAUTION_DIST)
+            turn += repulsion
+            if state == "FOLLOW":
+                state = "AVOID"
+
+        if left < CAUTION_DIST:
+            # Left wall close → push right
+            repulsion = REPULSION_K * (1.0 - left / CAUTION_DIST)
+            turn -= repulsion
+            if state == "FOLLOW":
+                state = "AVOID"
+
+        # ── Back safety: don't reverse into an obstacle ───────────────────
+        if forward < 0 and back < DANGER_DIST:
+            forward = 0.0
+
+        # Clamp turn to [-1, +1]
+        turn = max(-1.0, min(1.0, turn))
+
+        return forward, turn, state
+
+    # ── public API ────────────────────────────────────────────────────────
+
     def update(self, user_distance: float, x_offset: float, target_lost: bool) -> None:
         self.last_raw_dist = user_distance
+        obs = self._read_obstacles()
 
         if self.stopped:
             self.state = "STOP"
@@ -195,14 +292,10 @@ class FollowController:
             return
 
         if target_lost:
-            self._enter_search()
+            self._enter_search(obs)
             return
 
-        self.state = "FOLLOW"
-
-        # EMA filter: dampen sudden depth spikes while tracking gradual movement.
-        # On first reading after (re-)acquisition, seed the filter directly so
-        # the robot doesn't lurch toward a stale smoothed value.
+        # ── base follow logic (unchanged) ─────────────────────────────────
         if self._smooth_dist is None:
             self._smooth_dist = user_distance
         else:
@@ -210,18 +303,31 @@ class FollowController:
                                  + (1.0 - DIST_EMA_ALPHA) * self._smooth_dist)
 
         dist_error = self._smooth_dist - TARGET_DIST_M
-
-        # Dead-band: ignore tiny distance errors
         if abs(dist_error) < DIST_TOLERANCE:
             dist_error = 0.0
             self.pid.reset()
 
-        # forward: positive → move toward target (target is farther than desired)
         forward = self.pid.compute(dist_error)
+        turn    = -KP_STEER * x_offset
+        turn    = max(-1.0, min(1.0, turn))
 
-        # turn: negative x_offset (target left) → positive turn (turn left)
-        turn = -KP_STEER * x_offset
-        turn = max(-1.0, min(1.0, turn))
+        # ── apply obstacle avoidance ──────────────────────────────────────
+        forward, turn, state = self._apply_avoidance(forward, turn, x_offset, obs)
+
+        if state == "STOP":
+            # Boxed in — emergency stop
+            self.state = "STOP"
+            self.robot.stop()
+            self.last_smooth_dist = self._smooth_dist or 0.0
+            self.last_dist_err    = dist_error
+            self.last_forward     = 0.0
+            self.last_turn        = 0.0
+            self._record(0, 0)
+            print(f"[ctrl] STOP   boxed in  F={obs['front']:.2f} "
+                  f"L={obs['left']:.2f} R={obs['right']:.2f}")
+            return
+
+        self.state = state   # "FOLLOW" or "AVOID"
 
         left_pwm  = _deadband(forward - turn)
         right_pwm = _deadband(forward + turn)
@@ -233,26 +339,36 @@ class FollowController:
         self.last_turn        = turn
         self._record(left_pwm, right_pwm)
 
-        print(f"[ctrl] FOLLOW  raw={user_distance:.2f}m  "
-              f"smooth={self._smooth_dist:.2f}m  dist_err={dist_error:+.2f}m  "
+        obs_str = (f"F={obs['front']:.2f} L={obs['left']:.2f} "
+                   f"R={obs['right']:.2f} B={obs['back']:.2f}")
+        print(f"[ctrl] {state:6s} raw={user_distance:.2f}m  "
+              f"smooth={self._smooth_dist:.2f}m  err={dist_error:+.2f}m  "
               f"fwd={forward:+.3f}  turn={turn:+.3f}  "
-              f"L={left_pwm:+d}  R={right_pwm:+d}")
+              f"L={left_pwm:+d}  R={right_pwm:+d}  obs=[{obs_str}]")
 
-    def _enter_search(self) -> None:
+    def _enter_search(self, obs: dict) -> None:
         if self.state != "SEARCH":
             self.state        = "SEARCH"
-            self._smooth_dist = None   # reset filter so reacquisition seeds fresh
+            self._smooth_dist = None
             self.pid.reset()
             print("[ctrl] SEARCH — rotating to find user")
-        # Rotate in place: left wheel forward, right wheel backward
-        self.robot.set_wheels(SEARCH_PWM, -SEARCH_PWM)
-        self.last_forward   = 0.0
-        self.last_turn      = 0.0
-        self.last_dist_err  = 0.0
-        self._record(SEARCH_PWM, -SEARCH_PWM)
+
+        # Flip search direction if rotating toward an obstacle
+        if self._search_dir > 0 and obs["left"] < DANGER_DIST:
+            self._search_dir = -1
+            print("[ctrl] SEARCH — flipped to clockwise (left blocked)")
+        elif self._search_dir < 0 and obs["right"] < DANGER_DIST:
+            self._search_dir = +1
+            print("[ctrl] SEARCH — flipped to counter-clockwise (right blocked)")
+
+        spd = SEARCH_PWM * self._search_dir
+        self.robot.set_wheels(spd, -spd)
+        self.last_forward  = 0.0
+        self.last_turn     = 0.0
+        self.last_dist_err = 0.0
+        self._record(spd, -spd)
 
     def safety_stop(self) -> None:
-        """Call this when an obstacle is detected or stop button pressed."""
         self.stopped = True
         self.state   = "STOP"
         self.robot.stop()
@@ -264,7 +380,6 @@ class FollowController:
         print("[ctrl] Resumed")
 
     def get_status(self) -> dict:
-        """Snapshot for overlay / telemetry."""
         return {
             "state":      self.state,
             "stopped":    self.stopped,
@@ -276,6 +391,7 @@ class FollowController:
             "left_pwm":   self.last_left_pwm,
             "right_pwm":  self.last_right_pwm,
             "json_cmd":   {"T": 1, "L": self.last_left_pwm, "R": self.last_right_pwm},
+            "obstacles":  dict(self.last_obs),
         }
 
 
