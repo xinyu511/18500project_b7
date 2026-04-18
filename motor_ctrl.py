@@ -45,10 +45,10 @@ MIN_PWM  = 60    # minimum effective PWM — below this DC motors may stall
 SEARCH_PWM = 80  # rotation PWM during search (each wheel opposite sign)
 
 # ── obstacle avoidance constants ─────────────────────────────────────────────
-DANGER_DIST   = 0.25  # metres — emergency: hard turn / stop
-CAUTION_DIST  = 0.60  # metres — start slowing + steering around
-REPULSION_K   = 0.5   # side-repulsion gain (0 = ignore sides, 1 = very strong)
-AVOID_BIAS    = 0.6   # steering bias magnitude when front is blocked
+DANGER_DIST   = 0.40  # metres — emergency: full stop / hard turn
+CAUTION_DIST  = 0.80  # metres — start slowing + steering around
+REPULSION_K   = 0.6   # side-repulsion gain (0 = ignore sides, 1 = very strong)
+AVOID_BIAS    = 0.7   # steering bias magnitude when front is blocked
 
 # Depth noise filtering
 DIST_EMA_ALPHA = 0.2   # EMA smoothing factor: lower = smoother but slower to react
@@ -330,6 +330,19 @@ class FollowController:
         left_pwm  = _deadband(forward - turn)
         right_pwm = _deadband(forward + turn)
 
+        # ── final safety gate: refuse net-forward if front blocked ────────
+        if obs["front"] < DANGER_DIST:
+            # Allow pure rotation (one positive, one negative) but block
+            # net-forward motion (both wheels positive).
+            if left_pwm > 0 and right_pwm > 0:
+                left_pwm = 0
+                right_pwm = 0
+            # Also block if one wheel drives strongly forward
+            elif left_pwm > 0:
+                left_pwm = 0
+            elif right_pwm > 0:
+                right_pwm = 0
+
         self.robot.set_wheels(left_pwm, right_pwm)
         self.last_smooth_dist = self._smooth_dist
         self.last_dist_err    = dist_error
@@ -358,6 +371,14 @@ class FollowController:
         elif self._search_dir < 0 and obs["right"] < DANGER_DIST:
             self._search_dir = +1
             print("[ctrl] SEARCH — flipped to counter-clockwise (right blocked)")
+
+        # If front is blocked during search, stop rotating and wait
+        if obs["front"] < DANGER_DIST and obs["left"] < DANGER_DIST and obs["right"] < DANGER_DIST:
+            self.robot.stop()
+            self._record(0, 0)
+            print(f"[ctrl] SEARCH STOP — boxed in  F={obs['front']:.2f} "
+                  f"L={obs['left']:.2f} R={obs['right']:.2f}")
+            return
 
         spd = SEARCH_PWM * self._search_dir
         self.robot.set_wheels(spd, -spd)
