@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-if [[ -f ".venv/bin/activate" ]]; then
-  source .venv/bin/activate
+if [[ -f "env/bin/activate" ]]; then
+  source env/bin/activate
 fi
 exec python3 main.py \
   --ip 192.168.4.1 \
