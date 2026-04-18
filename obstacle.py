@@ -12,15 +12,13 @@ GPIO pins (BCM numbering):
 """
 
 import threading
-import time
+from time import sleep
+
+from gpiozero import DistanceSensor
 
 
-# Sensor polling interval — 50 ms gives ~20 Hz per sensor,
-# fast enough for 8-15 FPS vision loop without hogging the CPU.
-POLL_INTERVAL = 0.05
-
-# Default max range in metres (matches HC-SR04 practical limit).
-MAX_RANGE_M = 2.0
+POLL_INTERVAL = 0.05   # seconds between polling cycles
+MAX_RANGE_M   = 2      # max_distance passed to DistanceSensor
 
 
 class ObstacleSensors:
@@ -31,57 +29,40 @@ class ObstacleSensors:
         front_pins: tuple[int, int] = (23, 24),
         left_pins:  tuple[int, int] = (17, 27),
         right_pins: tuple[int, int] = (22, 10),
-        max_range_m: float = MAX_RANGE_M,
     ):
-        try:
-            from gpiozero import DistanceSensor  # noqa: PLC0415
-        except ImportError:
-            raise RuntimeError(
-                "gpiozero is required for ultrasonic sensors. "
-                "Install with:  pip install gpiozero"
-            )
-
+        # Create sensors exactly like sensor_test_all.py
         self._sensors = {
-            "front": DistanceSensor(
-                trigger=front_pins[0], echo=front_pins[1],
-                max_distance=max_range_m,
-            ),
-            "left": DistanceSensor(
-                trigger=left_pins[0], echo=left_pins[1],
-                max_distance=max_range_m,
-            ),
-            "right": DistanceSensor(
-                trigger=right_pins[0], echo=right_pins[1],
-                max_distance=max_range_m,
-            ),
+            "front": DistanceSensor(trigger=front_pins[0], echo=front_pins[1], max_distance=MAX_RANGE_M),
+            "left":  DistanceSensor(trigger=left_pins[0],  echo=left_pins[1],  max_distance=MAX_RANGE_M),
+            "right": DistanceSensor(trigger=right_pins[0], echo=right_pins[1], max_distance=MAX_RANGE_M),
         }
-        self._max = max_range_m
 
-        # Cached readings (metres).  Initialised to max range (= clear).
+        # Read each sensor once to verify they work
         self._lock = threading.Lock()
-        self._readings = {k: max_range_m for k in self._sensors}
+        self._readings = {}
+        for name, sensor in self._sensors.items():
+            dist = sensor.distance
+            self._readings[name] = dist
+            print(f"[obstacle] {name}: {dist*100:.1f} cm")
 
+        self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
-        print(f"[obstacle] 3 sensors initialised (max {max_range_m:.1f} m)")
+        print("[obstacle] 3 sensors ready")
 
     def _poll_loop(self) -> None:
-        """Continuously read all sensors and cache the results."""
-        while True:
+        while self._running:
             for name, sensor in self._sensors.items():
-                try:
-                    dist = sensor.distance  # metres, blocks ~5-12 ms
-                except Exception:
-                    dist = self._max  # treat read errors as "clear"
+                dist = sensor.distance
                 with self._lock:
                     self._readings[name] = dist
-            time.sleep(POLL_INTERVAL)
+            sleep(POLL_INTERVAL)
 
     def get_readings(self) -> dict[str, float]:
-        """Return a snapshot of all three sensor distances in metres."""
         with self._lock:
             return dict(self._readings)
 
     def close(self) -> None:
+        self._running = False
         for sensor in self._sensors.values():
             sensor.close()
