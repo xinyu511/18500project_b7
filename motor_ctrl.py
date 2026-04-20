@@ -37,7 +37,13 @@ KI_DIST = 0.05
 KD_DIST = 0.1
 
 # Proportional gain for steering (x_offset → turn contribution, normalised)
-KP_STEER = 0.5
+KP_STEER = 0.3
+
+# Steering smoothing — EMA to avoid reacting to per-frame jitter
+STEER_EMA_ALPHA = 0.3   # lower = smoother but slower to respond
+
+# Minimum interval between motor commands (seconds) — prevents acting on stale frames
+MIN_CMD_INTERVAL = 0.15
 
 # PWM limits
 MAX_PWM  = 255   # full PWM range
@@ -179,7 +185,9 @@ class FollowController:
         self.pid          = PID(KP_DIST, KI_DIST, KD_DIST, output_limit=1.0)
         self.state        = "FOLLOW"
         self.stopped      = False
-        self._smooth_dist = None
+        self._smooth_dist   = None
+        self._smooth_offset = 0.0   # EMA-smoothed x_offset
+        self._last_cmd_time = 0.0   # rate-limit motor commands
         self._search_dir  = 1   # +1 = left, -1 = right (flipped by obstacles)
 
         # Latest-command snapshot (overlay / logging)
@@ -280,6 +288,11 @@ class FollowController:
 
     def update(self, user_distance: float, x_offset: float, target_lost: bool) -> None:
         self.last_raw_dist = user_distance
+
+        # Smooth x_offset to filter per-frame jitter
+        self._smooth_offset = (STEER_EMA_ALPHA * x_offset
+                               + (1.0 - STEER_EMA_ALPHA) * self._smooth_offset)
+
         obs = self._read_obstacles()
 
         if self.stopped:
@@ -292,7 +305,13 @@ class FollowController:
             self._enter_search(obs)
             return
 
-        # ── base follow logic (unchanged) ─────────────────────────────────
+        # Rate-limit: skip this frame if too soon since last command
+        now = time.time()
+        if now - self._last_cmd_time < MIN_CMD_INTERVAL:
+            return
+        self._last_cmd_time = now
+
+        # ── base follow logic ─────────────────────────────────────────────
         if self._smooth_dist is None:
             self._smooth_dist = user_distance
         else:
@@ -311,10 +330,10 @@ class FollowController:
         # Use wider steering dead-band when person is close (forward clamped to 0)
         # so the robot stays still instead of jittering in place
         deadband = STEER_DEADBAND_CLOSE if forward == 0.0 else STEER_DEADBAND
-        if abs(x_offset) < deadband:
+        if abs(self._smooth_offset) < deadband:
             turn = 0.0
         else:
-            turn = -KP_STEER * x_offset
+            turn = -KP_STEER * self._smooth_offset
             turn = max(-1.0, min(1.0, turn))
 
         # ── apply obstacle avoidance ──────────────────────────────────────
