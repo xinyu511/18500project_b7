@@ -28,6 +28,7 @@ import requests
 # ── following controller constants ────────────────────────────────────────────
 TARGET_DIST_M  = 1.25   # desired following distance (metres)
 DIST_TOLERANCE = 0.10   # dead-band: no correction if |error| < this (metres)
+STEER_DEADBAND = 0.15   # no steering if |x_offset| < this (normalised, ~15% of frame)
 
 # PID gains for forward/backward (output in normalised [-1, +1])
 KP_DIST = 0.6
@@ -306,8 +307,11 @@ class FollowController:
         if forward < 0.0:
             forward = 0.0                    # never reverse — no rear camera
             self.pid.reset()                 # clear negative integral wind-up
-        turn    = -KP_STEER * x_offset
-        turn    = max(-1.0, min(1.0, turn))
+        if abs(x_offset) < STEER_DEADBAND:
+            turn = 0.0
+        else:
+            turn = -KP_STEER * x_offset
+            turn = max(-1.0, min(1.0, turn))
 
         # ── apply obstacle avoidance ──────────────────────────────────────
         forward, turn, state = self._apply_avoidance(forward, turn, x_offset, obs)
