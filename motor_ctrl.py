@@ -232,12 +232,19 @@ class FollowController:
         # ── Layer 1: EMERGENCY ────────────────────────────────────────────
         if front < DANGER_DIST:
             if left < DANGER_DIST and right < DANGER_DIST:
-                # Boxed in from three sides → full stop
+                # Boxed in on all 3 sides → just stop, don't turn away
                 return 0.0, 0.0, "STOP"
 
-            # Hard turn toward the clearest side
+            # Front blocked, at least one side clear — turn toward person
             forward = 0.0
-            if left >= right:
+            if x_offset < 0 and left >= DANGER_DIST:
+                # Person is left, left is clear → turn left
+                turn = +1.0
+            elif x_offset >= 0 and right >= DANGER_DIST:
+                # Person is right, right is clear → turn right
+                turn = -1.0
+            elif left >= right:
+                # Person's side blocked, turn toward clearer side
                 turn = +1.0
             else:
                 turn = -1.0
@@ -250,13 +257,11 @@ class FollowController:
             scale = (front - DANGER_DIST) / (CAUTION_DIST - DANGER_DIST)
             forward *= max(0.0, scale)
 
-            # Steer bias: prefer the side closest to the person so the robot
-            # arcs TOWARD the target, not away from it.
+            # Steer bias toward the person's side so we arc around the
+            # obstacle while keeping the target in view
             if x_offset < 0 and left > DANGER_DIST:
-                # Person is left, left is clear → go left
                 bias = +AVOID_BIAS
             elif x_offset >= 0 and right > DANGER_DIST:
-                # Person is right, right is clear → go right
                 bias = -AVOID_BIAS
             elif left >= right:
                 bias = +AVOID_BIAS
