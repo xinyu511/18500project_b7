@@ -32,7 +32,7 @@ STEER_DEADBAND       = 0.15   # no steering if |x_offset| < this (normalised, ~1
 STEER_DEADBAND_CLOSE = 0.40   # wider dead-band when person is at/closer than target distance
 
 # PID gains for forward/backward (output in normalised [-1, +1])
-KP_DIST = 0.6
+KP_DIST = 2.2
 KI_DIST = 0.05
 KD_DIST = 0.1
 
