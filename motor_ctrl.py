@@ -28,8 +28,8 @@ import requests
 # ── following controller constants ────────────────────────────────────────────
 TARGET_DIST_M  = 1.25   # desired following distance (metres)
 DIST_TOLERANCE = 0.10   # dead-band: no correction if |error| < this (metres)
-STEER_DEADBAND       = 0.15   # no steering if |x_offset| < this (normalised, ~15% of frame)
-STEER_DEADBAND_CLOSE = 0.40   # wider dead-band when person is at/closer than target distance
+STEER_DEADBAND       = 0.25   # no steering if |x_offset| < this (normalised, ~25% of frame)
+STEER_DEADBAND_CLOSE = 0.50   # wider dead-band when person is at/closer than target distance
 
 # PID gains for forward/backward (output in normalised [-1, +1])
 KP_DIST = 2.2
@@ -40,7 +40,7 @@ KD_DIST = 0.1
 KP_STEER = 0.3
 
 # Steering smoothing — EMA to avoid reacting to per-frame jitter
-STEER_EMA_ALPHA = 0.3   # lower = smoother but slower to respond
+STEER_EMA_ALPHA = 0.15  # lower = smoother but slower to respond
 
 # Minimum interval between motor commands (seconds) — prevents acting on stale frames
 MIN_CMD_INTERVAL = 0.15
